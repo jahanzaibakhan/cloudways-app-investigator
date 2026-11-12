@@ -179,7 +179,14 @@ def main() -> int:
         check("static-only Googlebot not blamed for PHP (<5% CPU, not HIGH)",
               pi.returncode == 0 and gb.get("php_cpu_share", 99) < 5 and gb.get("level") != "HIGH",
               f"cpu {gb.get('php_cpu_share')} level {gb.get('level')}")
-        check("HIGH PRIORITY FINDINGS block rendered", "HIGH PRIORITY FINDINGS" in p.stdout)
+        order = ["1. CRITICAL FINDINGS", "2. HIGH-PRIORITY FINDINGS", "3. TOP", "4. TOP 10 BOTS ACROSS THE SERVER",
+                 "5. OVERALL SERVER HEALTH", "6. APPLICATION TRAFFIC & BOT ANALYSIS", "7. PHP-FPM INVESTIGATION",
+                 "8. MYSQL / MARIADB INVESTIGATION", "9. ROOT CAUSE ANALYSIS", "10. INTERNAL PLATFORMOPS",
+                 "11. CUSTOMER-SHAREABLE", "12. SUPPORTING EVIDENCE", "FINAL FINDINGS SUMMARY"]
+        up = p.stdout.upper()
+        pos = [up.find(x) for x in order]
+        check("report sections in the required order", all(x >= 0 for x in pos) and pos == sorted(pos),
+              [o for o, x in zip(order, pos) if x < 0] or "ok")
         check("final findings table rendered", "| Finding" in p.stdout and "Recommended action" in p.stdout)
         check("credentials never printed", "secret" not in p.stdout and "secret" not in md)
         check("markdown report has no ANSI codes", "\x1b[" not in md)

@@ -4,6 +4,8 @@ A read-only investigation tool for Cloudways servers. It finds the applications 
 
 It replaces most of a manual "why is this server slow / which app is eating it" investigation with one command.
 
+See [CHANGELOG.md](CHANGELOG.md) for version history.
+
 ## Quick start
 
 Run as root on the Cloudways server:
@@ -32,18 +34,22 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 
 ## What the report contains
 
-1. Investigation Overview, followed by a **HIGH PRIORITY FINDINGS** block: every CRITICAL/HIGH finding (and the top WARNINGs), each with application, key metrics, evidence and next action
-2. Overall Server Health: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, the CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
-3. Top N resource-consuming applications, with profile tags: High CPU, High Memory, Many FPM workers, Low traffic / high cost
-4. Application Traffic Analysis: requests, req/min and req/s, unique IPs, top IPs/URLs/User-Agents, status codes, static vs dynamic, WordPress REST/admin-ajax/wp-login/xmlrpc/wp-cron, WooCommerce, attack indicators, and a per-app **Bot & crawler analysis**
-5. PHP-FPM Investigation: pool config, live and peak workers, listen queue, max_children hits, timeouts, duration percentiles, CPU ms/request, memory per request, slowest paths and slow-log functions
-6. MySQL / MariaDB Investigation: connections, query rates, lock waits, deadlocks, slow-query fingerprints per database/app, running queries per database
-7. Application-Level Bottlenecks: findings, each with numeric evidence, severity, a confidence level and a recommended next action
-8. Root Cause Analysis: root cause, confidence (Confirmed / Likely / Suspected / Inconclusive) and a two-line summary
-9. Internal PlatformOps Recommendations, each with the evidence that triggered it
-10. Customer-Shareable Recommendations, in a copy-paste block
-11. Evidence and Supporting Logs
-12. Final Investigation Summary: a consolidated table of Finding / Application / Severity / Recommended action, most severe first
+After the **Investigation Overview** (server, window, privileges, data sources):
+
+1. **Critical Findings**
+2. **High-Priority Findings** (HIGH, plus the top WARNINGs). Each shows the application, key metrics, evidence, confidence and next action.
+3. **Top Resource-Consuming Applications**: CPU and memory live vs window average/peak, PHP and backend requests, busy/idle workers, profile tags
+4. **Top Bots Across the Server**: one ranking over all applications
+5. **Overall Server Health**: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
+6. **Application Traffic & Bot Analysis**: requests, req/min and req/s, unique IPs, top IPs/URLs/User-Agents, status codes, static vs dynamic, WordPress REST/admin-ajax/wp-login/xmlrpc/wp-cron, WooCommerce, attack indicators, and a per-app top-10 bot table with estimated PHP cost
+7. **PHP-FPM Investigation & Slow Requests**: pool config, workers, listen queue, max_children hits, timeouts, duration percentiles, per-app processes. Also the 10 slowest / highest-CPU / highest-memory requests (wall time vs CPU time vs wait), repeated slow URLs, 5xx responses, and plugin/theme involvement from slow logs.
+8. **MySQL / MariaDB Investigation**: connections, query rates, lock waits, deadlocks, running queries per database, and slow queries as top-10 slowest, top-10 by total time and most frequent, with database → app mapping
+9. **Root Cause Analysis & Key Findings**: per-app root cause, confidence, two-line summary, then every finding with evidence and next action
+10. **Internal PlatformOps Recommendations**, each with the evidence that triggered it
+11. **Customer-Shareable Recommendations**, in a copy-paste block
+12. **Supporting Evidence**: slow-log traces, logs read, data availability notes
+
+The report ends with the **Final Findings Summary**: Finding / Application / Severity / Recommended action, most severe first.
 
 ## Options
 
@@ -67,6 +73,10 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 | `--cpu-high` / `--cpu-critical` / `--mem-high` | app severity thresholds as % of server capacity / RAM (default 40 / 70 / 30) |
 | `--attack-min-rpm` | below this backend req/min on an app without resource pressure, attack patterns are downgraded to INFO (Suspected) / WARNING (Likely) (default 60) |
 | `--php-rpm-per-core-warn` | PHP requests/min per vCPU considered high volume (default 120) |
+| `--server-bots-top N` / `--skip-bot-census` | size of the server-wide bot ranking (default 10) / skip that pass |
+| `--bot-requests-high` / `--bot-rpm-high` / `--bot-php-requests-high` | bot volume thresholds: requests per hour (5000), req/min (60), estimated PHP requests per hour (2000). Volume alone gives at most WARNING |
+| `--slow-request-seconds` / `--very-slow-request-seconds` / `--request-mem-high` | request flags SLOW (5s), HIGH (2x), VERY SLOW (30s), HIGH-MEM (256 MB) |
+| `--db-conn-high` | per-database connection peak flagged (default 40) |
 | `--help`, `--version` | usage and version |
 
 `--skip-health` is kept from the traffic analyzer for compatibility. Here it skips Redis/Varnish/OOM/filesystem checks; the WP health manager is never run. `--no-ip-lookup` is accepted and ignored, because this tool never sends visitor IPs to a third party.
@@ -232,6 +242,7 @@ What was actually run (2026-11-12):
 |---|---|---|
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
+| `tests/test_exact_counts.py` (29 checks): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **29/29 pass** |
 | `tests/test_scenarios.py` (23 checks) | macOS, synthetic | **23/23 pass** |
 | ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
@@ -261,6 +272,7 @@ The `tests/` folder is for development only. Servers fetch just `analyze_cloudwa
 | `tests/run_tests.sh` | runs all of the below |
 | `tests/test_parsers_and_bots.py` | log parsers (real Cloudways line formats), SQL masking, pool includes, bot verification with a stubbed DNS resolver, bot rating |
 | `tests/test_root_cause.py` | root-cause and recommendation logic (traffic-driven + upscale, DB slowness causing FPM saturation, idle app) |
+| `tests/test_exact_counts.py` | 29 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
 | `tests/test_scenarios.py` | 23-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
 | `tests/make_fixtures.py` | builds a small synthetic Cloudways applications root (slow plugin, busy shop, wp-login brute force) |
 

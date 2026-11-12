@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -1041,6 +1041,8 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
     over = Counter()
     heap_cpu, heap_dur, heap_mem = [], [], []
     ip_stats: dict[str, list] = {}
+    slow_paths: dict[str, list] = {}
+    err5 = Counter()
     seq = 0
     for f in files:
         for line in iter_lines(f, start, access_line_ts):
@@ -1097,8 +1099,15 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
                 a[3] = max(a[3], dur)
                 a[4] = max(a[4], mem_mb)
             seq += 1
-            rec = (ts.strftime("%H:%M:%S"), m["method"], m["status"], round(dur, 3), round(mem_mb, 1),
-                   round(cpu_pct, 1), trunc(uri, 90))
+            rec = {"time": ts.strftime("%H:%M:%S"), "method": m["method"], "status": m["status"], "dur": round(dur, 3),
+                   "cpu_s": round(cpu_s, 3), "cpu_pct": round(cpu_pct, 1), "mem": round(mem_mb, 1), "uri": trunc(uri, 90)}
+            if dur >= ctx.args.slow_request_seconds:
+                sp = slow_paths.setdefault(p, [0, 0.0, 0.0])
+                sp[0] += 1
+                sp[1] += dur
+                sp[2] = max(sp[2], dur)
+            if m["status"][0] == "5":
+                err5[(m["status"], trunc(p, 80))] += 1
             for heap, k in ((heap_cpu, cpu_s), (heap_dur, dur), (heap_mem, mem_mb)):
                 if len(heap) < 10:
                     heappush(heap, (k, seq, rec))
@@ -1118,6 +1127,8 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
         res["max_dur"] = durations[-1]
         res["peak_rpm"] = max(per_min.values())
         res["peak_rpm_at"] = max(per_min, key=per_min.get).strftime("%H:%M")
+        res["_per_min"] = dict(per_min)
+        res["_peak_min"] = max(per_min, key=per_min.get)
         peak_at = max(conc, key=conc.get) if conc else None
         peak = conc[peak_at] if peak_at is not None else 0
         res["peak_concurrency"] = round(peak, 1)
@@ -1131,6 +1142,11 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
         res["top_cpu_requests"] = [r for _, _, r in sorted(heap_cpu, reverse=True)]
         res["slowest_requests"] = [r for _, _, r in sorted(heap_dur, reverse=True)]
         res["top_mem_requests"] = [r for _, _, r in sorted(heap_mem, reverse=True)]
+        res["repeated_slow_paths"] = [
+            {"path": trunc(k, 70), "slow_hits": v[0], "hits": paths.get(k, [v[0]])[0], "avg_slow_s": round(v[1] / v[0], 2),
+             "max_s": round(v[2], 2)}
+            for k, v in sorted(slow_paths.items(), key=lambda kv: -kv[1][0]) if v[0] >= 2][:10]
+        res["fpm_5xx"] = [{"status": st, "path": pth, "count": c} for (st, pth), c in err5.most_common(10)]
     return res
 
 
@@ -1164,6 +1180,7 @@ def scan_fpm_master_logs(ctx: Ctx, apps: dict, start, end) -> dict:
             if mc:
                 o["max_children_hits"] += 1
                 o["limit"] = int(mc.group(1))
+                o.setdefault("minutes", Counter())[ts.replace(second=0)] += 1
             elif FPM_BUSY_RE.search(line):
                 o["busy_warnings"] += 1
             else:
@@ -1517,6 +1534,7 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
     unparsed = 0
     bots: dict[str, dict] = {}
     ip_err = Counter()
+    err5_urls = Counter()
     store_api = 0
     for f in files:
         for line in iter_lines(f, start, access_line_ts):
@@ -1562,6 +1580,8 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
             st = m["status"]
             if st in ("403", "404"):
                 ip_err[ip] += 1
+            elif st[0] == "5":
+                err5_urls[(st, trunc(path, 80))] += 1
             if "/wp-json/wc/store" in path or "rest_route=/wc/store" in uri:
                 store_api += 1
             bot = identify_bot(ua)
@@ -1601,7 +1621,7 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
             "top_urls": b["urls"].most_common(5), "status": b["status"].most_common(6),
             "dynamic": b["dynamic"], "static": n - b["dynamic"], "cats": dict(b["cats"]),
             "err_4xx": sum(v for k, v in b["status"].items() if k.startswith("4")),
-            "ua_sample": b["ua_sample"], "all_ips": dict(b["ips"].most_common(2000)),
+            "ua_sample": b["ua_sample"], "all_ips": dict(b["ips"].most_common(2000)), "_per_min": dict(b["per_min"]),
         })
     res["bots"] = bot_rows
     res["_ip_totals"] = {ip: ips[ip] for b in bot_rows for ip in b["all_ips"]}
@@ -1612,9 +1632,11 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
         res["bot_by_category"][b["category"]] += b["requests"]
     res["bot_by_category"] = res["bot_by_category"].most_common()
     res["store_api"] = store_api
+    res["_per_min"] = dict(per_min)
     res["err_403"] = status.get("403", 0)
     res["err_404"] = status.get("404", 0)
     res["top_err_ips"] = ip_err.most_common(3)
+    res["http_5xx"] = [{"status": st, "path": pth, "count": c} for (st, pth), c in err5_urls.most_common(10)]
     adm = Counter({ip: c["wp-admin"] + c["admin-ajax"] for ip, c in ip_cats.items() if c.get("wp-admin") or c.get("admin-ajax")})
     res["top_admin_ip"] = adm.most_common(1)[0] if adm else None
     for ip, n in ips.items():
@@ -1946,6 +1968,8 @@ def analyze_mysql_slowlog(ctx: Ctx, my: MySQL, mres: dict, db_to_app: dict, star
                 if q.lstrip().upper().startswith("SELECT") and (db, fp) not in samples_for_explain:
                     samples_for_explain[(db, fp)] = q[:20000]      # kept in memory only, never printed
                 d = by_db[db]
+                if cur_ts:
+                    d.setdefault("minutes", Counter())[cur_ts.replace(second=0)] += 1
                 d["count"] += 1
                 d["time"] += cur["qt"]
                 d["max"] = max(d["max"], cur["qt"])
@@ -1999,8 +2023,12 @@ def analyze_mysql_slowlog(ctx: Ctx, my: MySQL, mres: dict, db_to_app: dict, star
         a["avg_rows_sent"] = a["rows_sent"] / a["count"]
         a["scan_ratio"] = a["rows_ex"] / max(a["rows_sent"], 1)
         a["scan_suspect"] = (not a["dump"]) and a["avg_rows_ex"] >= 50_000 and a["scan_ratio"] >= 100
-    top = sorted(fps.values(), key=lambda x: -x["time"])[:15]
-    res["fingerprints"] = top
+    for a_ in fps.values():
+        a_["avg"] = a_["time"] / a_["count"]
+    allfp = sorted(fps.values(), key=lambda x: -x["time"])
+    top = allfp[:15]
+    res["fingerprints"] = allfp[:200]
+    res["distinct_fingerprints"] = len(fps)
     res["by_db"] = dict(sorted(by_db.items(), key=lambda kv: -kv[1]["time"]))
     if ctx.args.explain and my.ok:
         for a in [x for x in top if x["scan_suspect"]][:3]:
@@ -2110,6 +2138,80 @@ def varnish_info(ctx: Ctx) -> dict | None:
             "since": "service start"}
 
 
+def label_bot(b: dict, verifier) -> None:
+    """Set category_label; search engines are only 'verified' after reverse+forward DNS succeeds."""
+    if b["category"] == "search":
+        if b.get("dns"):
+            b["verification"] = verifier.verify(b["name"], b["dns"], [ip for ip, _ in b["top_ips"]])
+            st = b["verification"]["status"]
+        else:
+            st = "unverifiable"
+        if st == "verified":
+            b["category_label"] = "Search engine (verified)"
+        elif st.startswith("IMPERSONATION"):
+            b["category_label"] = "IMPERSONATION of " + b["name"]
+            b["impersonation"] = True
+        elif st.startswith("partially"):
+            b["category_label"] = "Search engine (partly impersonated)"
+            b["impersonation"] = True
+        else:
+            b["category_label"] = "Search engine (unverified)"
+    else:
+        b["category_label"] = BOT_CATEGORY_LABEL.get(b["category"], b["category"])
+
+
+def bot_census(ctx: Ctx, apps: dict, start, end, verifier) -> dict:
+    """Server-wide bot ranking across ALL applications (lightweight single pass per app)."""
+    total, apps_scanned = 0, 0
+    agg: dict[str, dict] = {}
+    win_min = max((end - start).total_seconds() / 60, 1)
+    for name, app in apps.items():
+        files = files_for_window(app["backend_logs"] or app["frontend_logs"], start)
+        if not files:
+            continue
+        apps_scanned += 1
+        for f in files:
+            for line in iter_lines(f, start, access_line_ts):
+                m = ACCESS_RE.match(line)
+                if not m:
+                    continue
+                ts = make_ts(m["y"], m["mon"], m["d"], m["h"], m["mi"], m["s"], m["tz"])
+                if not in_window(ts, start, end):
+                    continue
+                total += 1
+                bot = identify_bot(m["ua"] or "-")
+                if not bot:
+                    continue
+                b = agg.get(bot[0])
+                if b is None:
+                    b = agg[bot[0]] = {"name": bot[0], "category": bot[1], "dns": bot[2], "requests": 0, "dynamic": 0,
+                                       "apps": Counter(), "ips": Counter(), "urls": Counter(), "status": Counter(),
+                                       "per_min": Counter()}
+                b["requests"] += 1
+                path = m["uri"].split("?", 1)[0]
+                if classify_uri(m["uri"]) != "static":
+                    b["dynamic"] += 1
+                b["apps"][name] += 1
+                if len(b["ips"]) < 20000 or m["ip"] in b["ips"]:
+                    b["ips"][m["ip"]] += 1
+                if len(b["urls"]) < 5000 or path in b["urls"]:
+                    b["urls"][trunc(path, 80)] += 1
+                b["status"][m["status"]] += 1
+                b["per_min"][ts.replace(second=0)] += 1
+    rows = []
+    for b in sorted(agg.values(), key=lambda x: -x["requests"])[: ctx.args.server_bots_top]:
+        row = {"name": b["name"], "category": b["category"], "dns": list(b["dns"]) if b["dns"] else None,
+               "requests": b["requests"], "pct": pct(b["requests"], total), "rpm": b["requests"] / win_min,
+               "peak_rpm": max(b["per_min"].values()) if b["per_min"] else 0, "unique_ips": len(b["ips"]),
+               "top_ips": b["ips"].most_common(5), "top_urls": b["urls"].most_common(3),
+               "status": b["status"].most_common(4), "dynamic": b["dynamic"], "static": b["requests"] - b["dynamic"],
+               "apps": b["apps"].most_common(3), "app_count": len(b["apps"])}
+        label_bot(row, verifier)
+        rows.append(row)
+    return {"total": total, "apps_scanned": apps_scanned, "bots": rows,
+            "bot_requests": sum(b["requests"] for b in agg.values()), "distinct_bots": len(agg)}
+
+
 def correlate_bots(ctx: Ctx, verifier, p: dict):
     """Verify claimed search bots and estimate each bot's PHP requests / CPU via client IP."""
     t, fa = p.get("traffic") or {}, p.get("fpm") or {}
@@ -2118,22 +2220,7 @@ def correlate_bots(ctx: Ctx, verifier, p: dict):
     total_cpu = fa.get("cpu_s") or 0.0
     total_php = fa.get("requests") or 0
     for b in bots:
-        if b["category"] == "search" and b.get("dns"):
-            ips = [ip for ip, _ in b["top_ips"]]
-            b["verification"] = verifier.verify(b["name"], b["dns"], ips)
-            st = b["verification"]["status"]
-            if st == "verified":
-                b["category_label"] = "Search engine (verified)"
-            elif st.startswith("IMPERSONATION"):
-                b["category_label"] = "IMPERSONATION of " + b["name"]
-                b["impersonation"] = True
-            elif st.startswith("partially"):
-                b["category_label"] = "Search engine (partly impersonated)"
-                b["impersonation"] = True
-            else:
-                b["category_label"] = "Search engine (unverified)"
-        else:
-            b["category_label"] = BOT_CATEGORY_LABEL.get(b["category"], b["category"])
+        label_bot(b, verifier)
         php_n = cpu = 0.0
         if ip_stats:
             for ip, n in b["all_ips"].items():
@@ -2151,6 +2238,33 @@ def correlate_bots(ctx: Ctx, verifier, p: dict):
     t.pop("_ip_totals", None)
     fa.pop("_ip_stats", None)
     t["bot_php_cpu_share"] = sum(b["php_cpu_share"] for b in bots)
+    # Time correlation (co-occurrence, not attribution): bot share of backend traffic in stress minutes vs overall.
+    app_min = t.get("_per_min") or {}
+    bot_min = Counter()
+    for b in bots:
+        bot_min.update(b.get("_per_min") or {})
+    overall = pct(sum(bot_min.values()), sum(app_min.values()))
+
+    def share_in(minutes) -> tuple[float, int] | None:
+        mins = [m for m in minutes if m in app_min]
+        if not mins:
+            return None
+        return pct(sum(bot_min.get(m, 0) for m in mins), sum(app_min[m] for m in mins)), len(mins)
+    corr = {"overall_bot_share": overall}
+    if fa.get("_peak_min") is not None:
+        pm = fa["_peak_min"]
+        corr["php_peak"] = {"minute": pm.strftime("%H:%M"), "php_requests": (fa.get("_per_min") or {}).get(pm, 0),
+                            "bot_share": pct(bot_min.get(pm, 0), app_min.get(pm, 0)) if app_min.get(pm) else None}
+    if p.get("fpm_minutes"):
+        corr["max_children"] = share_in(p["fpm_minutes"])
+    if p.get("slow_minutes"):
+        corr["slow_queries"] = share_in(p["slow_minutes"])
+    t["bot_correlation"] = corr
+    for b in bots:
+        b.pop("_per_min", None)
+    t.pop("_per_min", None)
+    fa.pop("_per_min", None)
+    fa.pop("_peak_min", None)
 
 
 # ----------------------------------------------------------------------------
@@ -2256,7 +2370,8 @@ NEXT_ACTIONS = [
     ("Recurring slow database queries", "Review the query fingerprints with the developer: indexes, autoload options, object cache (Redis)."),
     ("mysqldump/backup", "No app action; consider moving backup windows away from peak traffic."),
     ("full table scan", "Add an appropriate index or rewrite the query (developer)."),
-    ("Possible missing index", "Run EXPLAIN on the query (--explain) to confirm before recommending an index."),
+    ("examines far more rows", "Re-run with --explain (read-only) to check the query plan before suggesting any index change."),
+    ("database connections", "Check for connection leaks/persistent connections and slow queries holding connections; compare with PHP-FPM busy workers."),
     ("concurrently running queries", "Inspect SHOW FULL PROCESSLIST during the peak; look for lock waits and slow fingerprints."),
     ("Long-running query", "Check whether it is expected (report/backup) or blocking others; do not kill without customer approval."),
     ("Elevated 5xx", "Check the app error log and PHP-FPM log for the 5xx timestamps."),
@@ -2303,15 +2418,30 @@ def bot_level(ctx: Ctx, b: dict, t: dict) -> str:
     # Absolute load: a large *share* of a nearly idle app is irrelevant. HIGH needs real PHP cost.
     core_pct = b.get("php_cpu_s_est", 0.0) / max(getattr(a, "window_s", 3600), 1) * 100.0
     b["php_core_pct"] = round(core_pct, 1)
-    heavy, notable = core_pct >= a.bot_high_cpu, core_pct >= a.bot_min_cpu or b["rpm"] >= 60
+    heavy, notable = core_pct >= a.bot_high_cpu, core_pct >= a.bot_min_cpu or b["rpm"] >= a.bot_rpm_high
+    reasons = []
+    hours = max(getattr(a, "window_s", 3600) / 3600, 1 / 60)
+    per_h = b["requests"] / hours
+    if per_h >= a.bot_requests_high:
+        reasons.append(f"{per_h:,.0f} requests/hour >= {a.bot_requests_high:,}")
+    if b["rpm"] >= a.bot_rpm_high:
+        reasons.append(f"{b['rpm']:.0f} req/min >= {a.bot_rpm_high:g}")
+    if b.get("php_requests_est", 0) / hours >= a.bot_php_requests_high:
+        reasons.append(f"~{b['php_requests_est'] / hours:,.0f} PHP requests/hour >= {a.bot_php_requests_high:,}")
+    if share >= a.bot_share_high:
+        reasons.append(f"{share:.0f}% of backend traffic >= {a.bot_share_high:g}%")
+    if heavy:
+        reasons.append(f"~{core_pct:.0f}% of a core PHP CPU >= {a.bot_high_cpu:g}%")
+    b["reasons"] = reasons
+    volume = any(r for r in reasons if "requests" in r or "req/min" in r)
     if b["category"] == "monitor" or b["name"].startswith("WordPress loopback"):
-        return "WARNING" if heavy or b["rpm"] >= 60 else "NORMAL"
+        return "WARNING" if heavy or b["rpm"] >= a.bot_rpm_high else "NORMAL"
     if b.get("category_label") == "Search engine (verified)":
         return "HIGH" if cpu >= 40 and heavy else "WARNING" if (share >= 40 or cpu >= 20) and notable else "NORMAL"
     mostly_static = pct(b["dynamic"], b["requests"]) < 20 and cpu < 10
     if (share >= a.bot_share_high or cpu >= 25) and heavy:
         return "WARNING" if mostly_static and not b.get("impersonation") else "HIGH"
-    if (share >= a.bot_share_warn or cpu >= 10) and notable or (b.get("impersonation") and notable):
+    if (share >= a.bot_share_warn or cpu >= 10) and notable or (b.get("impersonation") and notable) or volume:
         return "WARNING"
     return "NORMAL"
 
@@ -2414,7 +2544,7 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
         lb = p["long_busy"]
         fnd.append(F("php-fpm", "warning", "Likely", "Long-running PHP requests observed live (worker busy continuously)",
                      [f"PID {x['pid']} busy for ~{x['busy_s']}s of the {a.sample_seconds:.0f}s sample" for x in lb[:3]]
-                     + (["Slowest logged paths: " + ", ".join(f"{r[6]} ({r[3]}s)" for r in fa.get("slowest_requests", [])[:2])]
+                     + (["Slowest logged paths: " + ", ".join(f"{r['uri']} ({r['dur']}s)" for r in fa.get("slowest_requests", [])[:2])]
                         if fa.get("slowest_requests") else []), scenario="optimization"))
     if p.get("fpm_timeouts"):
         fnd.append(F("php-fpm", "critical", "Confirmed", "PHP requests were terminated by request_terminate_timeout",
@@ -2436,7 +2566,7 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
     if n >= 20 and fa.get("avg_mem") is not None and (fa["avg_mem"] >= 128 or fa["mem_max"] >= 512):
         fnd.append(F("php-fpm", "warning", "Confirmed", "High memory per PHP request",
                      [f"Average peak memory {fa['avg_mem']:.0f} MB, max {fa['mem_max']:.0f} MB per request"]
-                     + [f"{r[6]} - {r[4]} MB" for r in fa.get("top_mem_requests", [])[:2]]))
+                     + [f"{r['uri']} - {r['mem']} MB" for r in fa.get("top_mem_requests", [])[:2]]))
 
     # --- MySQL
     sdb = db.get("slow") or {}
@@ -2458,9 +2588,16 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
                          [f"{trunc(x['fingerprint'], 110)}", "EXPLAIN: " + ", ".join(f"{e['table']} type={e['type']} key={e['key']} rows={e['rows']}" for e in x["explain"][:3])],
                          scenario="database"))
         elif x.get("scan_suspect"):
-            fnd.append(F("mysql", "info", "Suspected", "Possible missing index (large rows examined vs rows returned; verify with EXPLAIN)",
-                         [f"avg rows examined {x['avg_rows_ex']:,.0f} vs sent {x['avg_rows_sent']:,.0f}: {trunc(x['fingerprint'], 100)}"]))
+            fnd.append(F("mysql", "info", "Suspected",
+                         "Query examines far more rows than it returns (index usage not verified - no EXPLAIN evidence)",
+                         [f"avg rows examined {x['avg_rows_ex']:,.0f} vs returned {x['avg_rows_sent']:,.0f}: {trunc(x['fingerprint'], 100)}"]))
     live = db.get("live") or {}
+    if live.get("conn_peak", 0) >= a.db_conn_high:
+        fnd.append(F("mysql", "high" if live["conn_peak"] >= a.db_conn_high * 2 else "warning", "Confirmed",
+                     f"High number of database connections for '{p['db']}'",
+                     [f"Peak {live['conn_peak']} connections (avg {live['conn_avg']:.1f}), {live['running_peak']} running at peak, "
+                      f"during {a.sample_seconds:.0f}s of processlist sampling"],
+                     metrics=[("Database", p["db"]), ("Connections peak", live["conn_peak"]), ("Running peak", live["running_peak"])]))
     if live.get("running_peak", 0) >= max(4, NCPU * 2):
         fnd.append(F("mysql", "warning", "Confirmed", "High number of concurrently running queries for this database",
                      [f"Peak {live['running_peak']} running / {live['conn_peak']} connections during sampling"], scenario="database"))
@@ -2491,6 +2628,17 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
         static_only = cpu_bots < 10 and all(pct(b["dynamic"], b["requests"]) < 20 for b in flagged)
         if static_only:
             worst = "info"
+        bc = t.get("bot_correlation") or {}
+        for b in flagged[:2]:
+            if b.get("reasons"):
+                ev.append(f"{b['name']} thresholds: " + "; ".join(b["reasons"]))
+        if (bc.get("php_peak") or {}).get("bot_share") is not None:
+            ev.append(f"Busiest PHP minute {bc['php_peak']['minute']} UTC ({bc['php_peak']['php_requests']} PHP req): bots "
+                      f"{bc['php_peak']['bot_share']:.0f}% of backend requests vs {bc['overall_bot_share']:.0f}% overall")
+        for key, label in (("max_children", "max_children-reached minutes"), ("slow_queries", "minutes with slow queries")):
+            if bc.get(key):
+                ev.append(f"During {bc[key][1]} {label}: bots {bc[key][0]:.0f}% of backend requests vs "
+                          f"{bc['overall_bot_share']:.0f}% overall (co-occurrence, not proof)")
         fnd.append(F("bots", worst, "Likely" if drives else "Confirmed",
                      "HIGH BOT TRAFFIC DETECTED" if worst == "high" else
                      "High bot request volume on static/cached content (not driving PHP)" if static_only else "Elevated bot traffic",
@@ -3099,14 +3247,14 @@ def short_action(a: str) -> str:
     return trunc(a, 64)
 
 
-def render_alerts(d: "Doc", R: dict):
-    alerts = collect_alerts(R)
-    d.banner("HIGH PRIORITY FINDINGS", "critical" if any(a["severity"] == "critical" for a in alerts) else
-             "high" if any(a["severity"] == "high" for a in alerts) else "ok")
+def render_alert_section(d: "Doc", R: dict, title: str, levels: tuple, max_warn: int = 6):
+    alerts = [a for a in collect_alerts(R) if a["severity"] in levels]
+    shown = [a for a in alerts if a["severity"] != "warning"] + [a for a in alerts if a["severity"] == "warning"][:max_warn]
+    worst = alerts[0]["severity"] if alerts else "ok"
+    d.banner(title, worst)
     if not alerts:
-        d.text("[HEALTHY] No CRITICAL, HIGH or WARNING findings - no significant resource or performance issue detected.", "ok")
-    shown = [a for a in alerts if a["severity"] in ("critical", "high")] + \
-        [a for a in alerts if a["severity"] == "warning"][:6]
+        names = "/".join(SEV_NAME[x] for x in levels)
+        d.text(f"[HEALTHY] No {names} findings.", "ok")
     for a in shown:
         d.blank()
         d.text(f"{SEV_TAG[a['severity']]} {a['text'].upper()}", a["severity"])
@@ -3119,8 +3267,31 @@ def render_alerts(d: "Doc", R: dict):
         d.kv(rows)
     hidden = len(alerts) - len(shown)
     if hidden > 0:
-        d.text(f"(+{hidden} more WARNING findings in section 7 and the final summary)")
-    d.banner("", None)
+        d.text(f"(+{hidden} more WARNING findings in section 9 and the Final Findings Summary)")
+
+
+def render_server_bots(d: "Doc", R: dict):
+    c = R.get("census")
+    if not c:
+        d.text("Skipped (--skip-bot-census)." if c is None else "No data.")
+        return
+    if not c["total"]:
+        d.text("No access-log traffic found in the window.")
+        return
+    d.kv([("Backend requests (all apps)", f"{c['total']:,} across {c['apps_scanned']} application(s)"),
+          ("Identified automated traffic", f"{c['bot_requests']:,} ({pct(c['bot_requests'], c['total']):.0f}%) from {c['distinct_bots']} bot(s)")])
+    if not c["bots"]:
+        d.text("No identifiable bots.")
+        return
+    d.table(["Bot", "Category", "Requests", "% all", "/min", "IPs", "Backend (dyn)", "Apps", "Top app"],
+            [[b["name"], b["category_label"], f"{b['requests']:,}", f"{b['pct']:.1f}%", f"{b['rpm']:.1f}", b["unique_ips"],
+              f"{b['dynamic']:,}", b["app_count"], b["apps"][0][0] if b["apps"] else "-"] for b in c["bots"]],
+            align=["l", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[24, 28, 0, 0, 0, 0, 0, 0, 12])
+    for b in c["bots"][:3]:
+        d.bullet(f"{b['name']}: top URLs " + ", ".join(f"{u} ({n:,})" for u, n in b["top_urls"]) +
+                 " | status " + ", ".join(f"{k}:{v:,}" for k, v in b["status"]), None)
+    d.text("Category is from the User-Agent; search engines are 'verified' only after reverse+forward DNS succeeds. "
+           "Per-app PHP cost of each bot is in section 6.")
 
 
 LEVEL_SEV = {"HIGH": "high", "WARNING": "warning", "NORMAL": "ok"}
@@ -3162,6 +3333,58 @@ def render_bots(d: "Doc", p: dict):
     d.text("Bots cannot be attributed MySQL activity directly (no per-request DB data); see section 6 for database load.")
 
 
+def req_flag(r: dict, a) -> str:
+    f = []
+    if r["dur"] >= a.very_slow_request_seconds:
+        f.append("VERY SLOW")
+    elif r["dur"] >= a.slow_request_seconds * 2:
+        f.append("HIGH")
+    elif r["dur"] >= a.slow_request_seconds:
+        f.append("SLOW")
+    if r["mem"] >= a.request_mem_high:
+        f.append("HIGH-MEM")
+    if r["status"][0] == "5":
+        f.append(r["status"])
+    return ",".join(f) or "-"
+
+
+def render_slow_requests(d: "Doc", p: dict, a):
+    fa, sl, t = p.get("fpm") or {}, p.get("slow") or {}, p.get("traffic") or {}
+    if not fa.get("requests"):
+        return
+    d.text(f"Slow request analysis - thresholds: SLOW >= {a.slow_request_seconds:g}s, HIGH >= {a.slow_request_seconds * 2:g}s, "
+           f"VERY SLOW >= {a.very_slow_request_seconds:g}s, HIGH-MEM >= {a.request_mem_high:g} MB (all configurable).")
+    d.text("Wall = request duration; CPU s = CPU time actually used; Wait = time not on CPU (database, external HTTP, disk).")
+
+    def rows(lst):
+        return [[r["time"], r["method"], r["status"], f"{r['dur']:.2f}", f"{r['cpu_s']:.2f}",
+                 f"{max(0.0, 100 - r['cpu_pct']):.0f}%", f"{r['mem']:.0f}", req_flag(r, a), r["uri"]] for r in lst[:10]]
+    hdr = ["Time", "Mth", "St", "Wall s", "CPU s", "Wait", "MB", "Flag"]
+    al = ["l", "l", "l", "r", "r", "r", "r", "l", "l"]
+    mw = [0, 0, 0, 0, 0, 0, 0, 14, 40]
+    if fa.get("slowest_requests"):
+        d.table(hdr + ["URI - 10 slowest (wall time)"], rows(fa["slowest_requests"]), align=al, maxw=mw)
+    if fa.get("top_cpu_requests"):
+        d.table(hdr + ["URI - 10 highest CPU time"], rows(fa["top_cpu_requests"]), align=al, maxw=mw)
+    if fa.get("top_mem_requests"):
+        d.table(hdr + ["URI - 10 highest memory"], rows(fa["top_mem_requests"]), align=al, maxw=mw)
+    if fa.get("repeated_slow_paths"):
+        d.table(["Repeated slow URL", "Slow hits", "All hits", "Avg slow s", "Max s"],
+                [[x["path"], x["slow_hits"], x["hits"], x["avg_slow_s"], x["max_s"]] for x in fa["repeated_slow_paths"]],
+                maxw=[50, 0, 0, 0, 0])
+    errs = [("PHP-FPM", x) for x in fa.get("fpm_5xx", [])] + [("access log", x) for x in t.get("http_5xx", [])]
+    if errs:
+        d.table(["Source", "Status", "URL", "Count"], [[src, x["status"], x["path"], f"{x['count']:,}"] for src, x in errs[:12]],
+                align=["l", "l", "l", "r"], maxw=[0, 0, 56, 0])
+        d.text("500 is returned by PHP itself; 502/503/504 come from the proxy/web server (PHP-FPM unavailable, timed out or saturated).")
+    else:
+        d.text("No HTTP 5xx responses in the window.", "ok")
+    if sl.get("components"):
+        tot = sum(sl["components"].values()) or 1
+        d.table(["Plugin / theme / component (slow-log)", "Traces", "Share"],
+                [[c, k, f"{pct(k, tot):.0f}%"] for c, k in sl["components"].most_common(8)], maxw=[44, 0, 0])
+
+
 def map_label(app: str, src: str | None) -> str:
     if not app:
         return "unmapped"
@@ -3179,7 +3402,7 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
     top, h, hist = R["top"], R["health"], R["health"].get("history") or {}
     d.h1("CLOUDWAYS APPLICATION INVESTIGATION REPORT")
     # 1. Overview
-    d.h2("1. Investigation Overview")
+    d.h2("Investigation Overview")
     d.kv([("Server", f"{R['hostname']} ({R['server_ip']})"), ("Generated At", R["generated"] + " UTC"),
           ("Traffic/log window", R["window_desc"]), ("Live sampling", f"{R['sample']['elapsed']:.0f}s, {R['sample']['samples']} samples"),
           ("Applications", f"Top {len(top)} of {R['app_count']} investigated"),
@@ -3188,9 +3411,38 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
           ("Tool version", VERSION)])
     d.text("CPU values are '% of one vCPU core' unless marked 'of server'. 'Estimated' marks derived values; everything else is measured.")
     d.text("Severity: CRITICAL (red) > HIGH (orange) > WARNING (yellow) > INFO (blue) > HEALTHY (green).")
-    render_alerts(d, R)
+    # 1-2. Alerts first
+    render_alert_section(d, R, "1. CRITICAL FINDINGS", ("critical",))
+    render_alert_section(d, R, "2. HIGH-PRIORITY FINDINGS", ("high", "warning"))
+    # 3. Top apps
+    d.h2(f"3. Top {len(top)} Resource-Consuming Applications")
+    def pc(v):
+        return f"{v:.0f}%" if v is not None else "n/a"
+    d.text("CPU and memory - LIVE (instantaneous, during sampling) vs WINDOW (historical average over the log window):")
+    d.table(["#", "Application", "CPU live", "CPU live pk", "CPU window", "CPU win pk", "Srv%", "Mem live", "Mem window"],
+            [[i, p["app"], pc(p.get("cpu_live_avg")), pc(p.get("cpu_live_peak")),
+              pc(p["cpu_hist_avg"] if p.get("cpu_hist_avg") is not None else p.get("cpu_fpm_pct")),
+              pc(p.get("cpu_hist_peak")), f"{p['cpu_server_share']:.0f}%",
+              (f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}" if p['mem_mb'] is not None else "n/a"), fmt_mb(p.get("mem_hist_avg")) + (" RSS" if p.get("mem_hist_avg") else "")]
+             for i, p in enumerate(top, 1)],
+            align=["r", "l", "r", "r", "r", "r", "r", "r", "r"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 0])
+    d.text("CPU in % of one vCPU core. Srv% = sustained CPU as share of total server capacity (used for ranking).")
+    d.table(["#", "Application", "PHP req", "Backend req", "FPM procs", "Busy pk", "Idle", "max_children", "Profile"],
+            [[i, p["app"], fmt_num(p["php_requests"]), fmt_num((p.get("traffic") or {}).get("total")),
+              p.get("fpm_procs_last", 0), p["busy_peak"], max(0, p.get("fpm_procs_last", 0) - p.get("busy_last", 0)),
+              p.get("max_children") or "?", ", ".join(p["tags"])] for i, p in enumerate(top, 1)],
+            align=["r", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 30])
+    for p in top:
+        d.bullet(f"{p['app']}: {p['domain'] or 'domain n/a'} [{p['type']}] path {p['app_dir']} | DB '{p['db']}' "
+                 f"(mapping: {p['db_source']}) | CPU source: {p['cpu_source']}"
+                 + (f" | live {p['cpu_live_avg']:.0f}%/peak {p['cpu_live_peak']:.0f}%" if p.get("cpu_live_avg") is not None else "")
+                 + (f" | history peak {p['cpu_hist_peak']:.0f}% at {p['cpu_hist_peak_at']}" if p.get("cpu_hist_peak") is not None else "")
+                 + f" | memory {p['mem_kind']}" + (f", history avg {fmt_mb(p['mem_hist_avg'])} RSS" if p.get("mem_hist_avg") else ""))
+    # 4. Server-wide bots
+    d.h2(f"4. Top {ctx.args.server_bots_top} Bots Across the Server")
+    render_server_bots(d, R)
     # 2. Server health
-    d.h2("2. Overall Server Health")
+    d.h2("5. Overall Server Health")
     load = h.get("load", (0, 0, 0))
     rows = [("vCPUs", NCPU),
             ("CPU busy (live)", f"{h.get('cpu_busy', 0):.0f}% avg / {h.get('cpu_busy_peak', 0):.0f}% peak", sev_for(h.get("cpu_busy"), 70, 90))]
@@ -3231,32 +3483,8 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
         d.bullet(f"{f['text']} ({f['confidence']}): " + "; ".join(f["evidence"][:2]), f["severity"])
         if f.get("action"):
             d.bullet("Next action: " + f["action"], None, 1)
-    # 3. Top apps
-    d.h2(f"3. Top {len(top)} Resource-Consuming Applications")
-    def pc(v):
-        return f"{v:.0f}%" if v is not None else "n/a"
-    d.text("CPU and memory - LIVE (instantaneous, during sampling) vs WINDOW (historical average over the log window):")
-    d.table(["#", "Application", "CPU live", "CPU live pk", "CPU window", "CPU win pk", "Srv%", "Mem live", "Mem window"],
-            [[i, p["app"], pc(p.get("cpu_live_avg")), pc(p.get("cpu_live_peak")),
-              pc(p["cpu_hist_avg"] if p.get("cpu_hist_avg") is not None else p.get("cpu_fpm_pct")),
-              pc(p.get("cpu_hist_peak")), f"{p['cpu_server_share']:.0f}%",
-              (f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}" if p['mem_mb'] is not None else "n/a"), fmt_mb(p.get("mem_hist_avg")) + (" RSS" if p.get("mem_hist_avg") else "")]
-             for i, p in enumerate(top, 1)],
-            align=["r", "l", "r", "r", "r", "r", "r", "r", "r"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 0])
-    d.text("CPU in % of one vCPU core. Srv% = sustained CPU as share of total server capacity (used for ranking).")
-    d.table(["#", "Application", "PHP req", "Backend req", "FPM procs", "Busy pk", "Idle", "max_children", "Profile"],
-            [[i, p["app"], fmt_num(p["php_requests"]), fmt_num((p.get("traffic") or {}).get("total")),
-              p.get("fpm_procs_last", 0), p["busy_peak"], max(0, p.get("fpm_procs_last", 0) - p.get("busy_last", 0)),
-              p.get("max_children") or "?", ", ".join(p["tags"])] for i, p in enumerate(top, 1)],
-            align=["r", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 30])
-    for p in top:
-        d.bullet(f"{p['app']}: {p['domain'] or 'domain n/a'} [{p['type']}] path {p['app_dir']} | DB '{p['db']}' "
-                 f"(mapping: {p['db_source']}) | CPU source: {p['cpu_source']}"
-                 + (f" | live {p['cpu_live_avg']:.0f}%/peak {p['cpu_live_peak']:.0f}%" if p.get("cpu_live_avg") is not None else "")
-                 + (f" | history peak {p['cpu_hist_peak']:.0f}% at {p['cpu_hist_peak_at']}" if p.get("cpu_hist_peak") is not None else "")
-                 + f" | memory {p['mem_kind']}" + (f", history avg {fmt_mb(p['mem_hist_avg'])} RSS" if p.get("mem_hist_avg") else ""))
     # 4. Traffic
-    d.h2("4. Application Traffic Analysis")
+    d.h2("6. Application Traffic & Bot Analysis")
     for p in top:
         t = p.get("traffic") or {}
         d.h3(p["app"] + (f" ({p['domain']})" if p["domain"] else ""))
@@ -3286,13 +3514,9 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
         if not p.get("traffic_signals"):
             d.bullet("No suspicious-traffic indicators triggered.", "ok")
         render_bots(d, p)
-    return build_report_part2(ctx, R, d)
-
-
-def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
     top = R["top"]
     # 5. PHP-FPM
-    d.h2("5. PHP-FPM Investigation")
+    d.h2("7. PHP-FPM Investigation & Slow Requests")
     for p in top:
         pool, fa, sl = p.get("pool") or {}, p.get("fpm") or {}, p.get("slow") or {}
         d.h3(f"{p['app']} - pool {pool.get('pool', '?')} (PHP {pool.get('php_version', '?')})")
@@ -3328,6 +3552,7 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
         if fa.get("top_paths_cpu"):
             d.table(["Path (by CPU)", "Hits", "CPU s", "Avg s", "Max s", "Max MB"],
                     [[x["path"], x["hits"], x["cpu_s"], x["avg_s"], x["max_s"], x["max_mb"]] for x in fa["top_paths_cpu"][:6]], maxw=[46, 0, 0, 0, 0, 0])
+        render_slow_requests(d, p, ctx.args)
         if sl.get("functions"):
             d.table(["Slow function (slow-log)", "Location", "Traces"],
                     [[fn + "()", loc, k] for (fn, loc), k in sl["functions"].most_common(5)], align=["l", "l", "r"], maxw=[30, 46, 0])
@@ -3335,7 +3560,7 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
             for c in [c for c in p["long_cli"] if c["live_cpu"] >= 2 or c["life_cpu"] >= 5][:3]:
                 d.bullet("Background process " + fmt_proc(c), "info")
     # 6. MySQL
-    d.h2("6. MySQL / MariaDB Investigation")
+    d.h2("8. MySQL / MariaDB Investigation")
     m = R["mysql"]
     if not m.get("available"):
         d.text(f"Not available: {m.get('error')}", "warning")
@@ -3357,9 +3582,19 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
                     [[db, map_label(x["app"], R["db_map_src"].get(db)), x["count"], f"{x['time']:.0f}", f"{x['max']:.1f}"] for db, x in list(bydb.items())[:8]])
         fps = R["mysql_slow"].get("fingerprints", [])
         if fps:
-            d.table(["DB", "Count", "Total s", "Max s", "Rows exam.", "Query fingerprint (literals masked)"],
-                    [[x["db"], x["count"], f"{x['time']:.0f}", f"{x['max']:.1f}", f"{x['avg_rows_ex']:,.0f}",
-                      ("[dump] " if x["dump"] else "") + x["fingerprint"]] for x in fps[:8]], maxw=[12, 0, 0, 0, 0, 52])
+            d.text(f"{R['mysql_slow'].get('total', 0):,} slow queries in {R['mysql_slow'].get('distinct_fingerprints', len(fps))} distinct "
+                   "patterns. Literals are masked (?); [dump] = mysqldump/backup read, not application load.")
+
+            def fp_rows(lst):
+                return [[x["db"], map_label(x["app"], R["db_map_src"].get(x["db"])), f"{x['count']:,}", f"{x['time']:.0f}",
+                         f"{x['avg']:.1f}", f"{x['max']:.1f}", f"{x['avg_rows_ex']:,.0f}",
+                         ("[dump] " if x["dump"] else "") + x["fingerprint"]] for x in lst[:10]]
+            hdr = ["DB", "App (mapping)", "Count", "Total s", "Avg s", "Max s", "Rows exam."]
+            mw = [12, 18, 0, 0, 0, 0, 0, 46]
+            d.table(hdr + ["Top 10 slowest queries (by max time)"], fp_rows(sorted(fps, key=lambda x: -x["max"])), maxw=mw)
+            d.table(hdr + ["Top 10 by total execution time"], fp_rows(fps), maxw=mw)
+            d.table(hdr + ["Most frequently repeated patterns"], fp_rows(sorted(fps, key=lambda x: -x["count"])), maxw=mw)
+            d.text("Missing indexes are only reported with EXPLAIN evidence (--explain); a high rows-examined value alone is not proof.")
         per_db = m.get("per_db", {})
         if per_db:
             d.table(["Database", "Application (mapping)", "Conn avg/peak", "Running avg/peak"],
@@ -3367,20 +3602,8 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
                      for db, x in sorted(per_db.items(), key=lambda kv: -kv[1]["running_peak"])[:8]])
         for q in m.get("long_running", [])[:5]:
             d.bullet(f"[{q['db']}] {q['time_s']}s {q['state']}: {q['query']}", "info" if q["dump"] else "warning")
-    # 7. App bottlenecks / findings
-    d.h2("7. Application-Level Bottlenecks (Key Findings)")
-    for p in top:
-        d.h3(p["app"])
-        if not p["findings"]:
-            d.bullet("No bottleneck indicators found.", "ok")
-        for f in p["findings"]:
-            d.bullet(f"{f['text']} [{f['confidence']}]", f["severity"])
-            for e in f["evidence"][:4]:
-                d.bullet(e, None, 1)
-            if f.get("action"):
-                d.bullet("Next action: " + f["action"], None, 1)
     # 8. RCA
-    d.h2("8. Root Cause Analysis")
+    d.h2("9. Root Cause Analysis & Key Findings")
     for p in top:
         rc = p["root_cause"]
         d.h3(p["app"])
@@ -3390,8 +3613,20 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
         d.text("INVESTIGATION SUMMARY:")
         for ln in p["summary"]:
             d.text(ln)
+    # 7. App bottlenecks / findings
+    d.h3("Key findings per application (evidence and next action)")
+    for p in top:
+        d.text(p["app"] + ":")
+        if not p["findings"]:
+            d.bullet("No bottleneck indicators found.", "ok")
+        for f in p["findings"]:
+            d.bullet(f"{f['text']} [{f['confidence']}]", f["severity"])
+            for e in f["evidence"][:4]:
+                d.bullet(e, None, 1)
+            if f.get("action"):
+                d.bullet("Next action: " + f["action"], None, 1)
     # 9. Internal
-    d.h2("9. Internal PlatformOps Recommendations (NOT for customer)")
+    d.h2("10. Internal PlatformOps Recommendations (NOT for customer)")
     if not R["internal"]:
         d.bullet("No action required based on collected evidence.", "ok")
     for rec in R["internal"]:
@@ -3399,7 +3634,7 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
         for e in rec["evidence"][:4]:
             d.bullet("Evidence: " + e, None, 1)
     # 10. Customer
-    d.h2("10. Customer-Shareable Recommendations")
+    d.h2("11. Customer-Shareable Recommendations")
     d.text(">>> BEGIN CUSTOMER RESPONSE >>>")
     for c in R["customer"]:
         d.text(c["title"] + (f" ({', '.join(c['apps'])})" if c.get("apps") else ""))
@@ -3407,16 +3642,10 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
         d.blank()
     d.text("<<< END CUSTOMER RESPONSE <<<")
     # 11. Evidence
-    d.h2("11. Evidence and Supporting Logs")
+    d.h2("12. Supporting Evidence")
     for p in top:
         fa, sl = p.get("fpm") or {}, p.get("slow") or {}
         d.h3(p["app"])
-        if fa.get("slowest_requests"):
-            d.table(["Time", "Mth", "St", "Sec", "MB", "CPU%", "URI (slowest)"], [list(r) for r in fa["slowest_requests"][:5]],
-                    align=["l", "l", "l", "r", "r", "r", "l"], maxw=[0, 0, 0, 0, 0, 0, 44])
-        if fa.get("top_cpu_requests"):
-            d.table(["Time", "Mth", "St", "Sec", "MB", "CPU%", "URI (most CPU)"], [list(r) for r in fa["top_cpu_requests"][:5]],
-                    align=["l", "l", "l", "r", "r", "r", "l"], maxw=[0, 0, 0, 0, 0, 0, 44])
         for smp in sl.get("samples", [])[:2]:
             d.bullet(f"slow-log {smp['time']} {smp['script']}", "info")
             for fr in smp["frames"]:
@@ -3427,7 +3656,7 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
     for n in ctx.notes or ["All data sources were available."]:
         d.bullet(n, "info")
     # 12. Final
-    d.h2("12. Final Investigation Summary")
+    d.h2("Final Findings Summary")
     alerts = collect_alerts(R, "info")
     rank = [a for a in alerts if a["severity"] != "info"] or alerts[:5]
     if rank:
@@ -3500,13 +3729,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--php-rpm-per-core-warn", type=float, default=120,
                     help="PHP requests/min per vCPU considered high volume (default 120)")
     ap.add_argument("--cpu-ms-per-req-threshold", type=float, default=400, help="Inefficient PHP above this CPU ms/request (default 400)")
+    ap.add_argument("--slow-request-seconds", type=float, default=5, help="Request flagged SLOW at this duration (default 5s)")
+    ap.add_argument("--very-slow-request-seconds", type=float, default=30, help="Request flagged VERY SLOW (default 30s)")
+    ap.add_argument("--request-mem-high", type=float, default=256, help="Request peak memory flagged HIGH-MEM, MB (default 256)")
     ap.add_argument("--slow-p95-seconds", type=float, default=3, help="Slow PHP when p95 duration >= this (default 3s)")
     ap.add_argument("--slow-query-min", type=int, default=10, help="Min slow queries per DB to flag (default 10)")
+    ap.add_argument("--db-conn-high", type=int, default=40, help="Per-database connection peak flagged (default 40)")
     ap.add_argument("--long-query-seconds", type=int, default=10, help="Running query considered long (default 10s)")
     ap.add_argument("--steal-threshold", type=float, default=8)
     ap.add_argument("--long-request-seconds", type=float, default=10,
                     help="Live: FPM worker busy continuously this long = long-running request (default 10)")
     ap.add_argument("--bg-cpu-threshold", type=float, default=10, help="Background process CPU %% of one core to flag (default 10)")
+    ap.add_argument("--skip-bot-census", action="store_true", help="Skip the server-wide top-bots pass over all applications")
+    ap.add_argument("--server-bots-top", type=int, default=10, help="Bots listed in the server-wide ranking (default 10)")
     ap.add_argument("--no-dns-verify", action="store_true",
                     help="Do not verify claimed search-engine bots via reverse/forward DNS")
     ap.add_argument("--dns-verify-max", type=int, default=60, help="Max IPs to DNS-verify per run (default 60)")
@@ -3514,6 +3749,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--bot-share-warn", type=float, default=10, help="Bot share flagged WARNING (default 10%%)")
     ap.add_argument("--attack-min-rpm", type=float, default=60,
                     help="Below this backend req/min on a non-loaded app, attack patterns are reported as INFO/WARNING only (default 60)")
+    ap.add_argument("--bot-requests-high", type=int, default=5000,
+                    help="A single bot above this many requests per hour (window average) is at least WARNING (default 5000)")
+    ap.add_argument("--bot-rpm-high", type=float, default=60, help="Bot requests/min flagged (default 60)")
+    ap.add_argument("--bot-php-requests-high", type=int, default=2000,
+                    help="Estimated bot PHP requests per hour flagged (default 2000)")
     ap.add_argument("--bot-high-cpu", type=float, default=5,
                     help="Bot PHP CPU (%% of one core, window average) required for HIGH (default 5)")
     ap.add_argument("--bot-min-cpu", type=float, default=2,
@@ -3612,12 +3852,19 @@ def investigate(args) -> tuple[Ctx, dict]:
         pools_by_app[pool["app"]].append(pool)
     listen = sample["server"]["listen"]
     verifier = BotVerifier(ctx)
+    census = None
+    if not args.skip_bot_census:
+        ctx.progress(f"Server-wide bot census across {len(scope)} applications")
+        census = bot_census(ctx, scope, start, end, verifier)
     for p in top:
         ap = apps[p["app"]]
         ctx.progress(f"[{p['app']}] deep analysis: FPM access log, traffic, slow log")
         p["fpm"] = analyze_fpm_access(ctx, ap, start, end, deep=True)
         p["traffic"] = analyze_traffic(ctx, ap, start, end)
         p["slow"] = analyze_slowlog(ctx, ap, start, end)
+        p["fpm_minutes"] = list((fpm_events.get(p["app"], {}).get("minutes") or {}).keys())
+        dbs_ = {db for db, a_ in db_to_app.items() if a_ == p["app"]}
+        p["slow_minutes"] = [m for db, x in mslow.get("by_db", {}).items() if db in dbs_ for m in (x.get("minutes") or {})]
         correlate_bots(ctx, verifier, p)
         p["cron"] = analyze_cron_log(ap, start)
         cands = sorted(pools_by_app.get(p["app"], []), key=lambda x: x.get("php_version", ""))
@@ -3680,7 +3927,7 @@ def investigate(args) -> tuple[Ctx, dict]:
     internal, customer = recommendations(ctx, top, srv_find, health)
     host, ip = server_identity()
     origin = issue_origin(ctx, health, attribution, srv_find, top)
-    R = {"origin": origin, "db_map_src": db_map_src, "hostname": host, "server_ip": ip, "generated": now.strftime("%Y-%m-%d %H:%M:%S"), "window_desc": window_desc,
+    R = {"census": census, "origin": origin, "db_map_src": db_map_src, "hostname": host, "server_ip": ip, "generated": now.strftime("%Y-%m-%d %H:%M:%S"), "window_desc": window_desc,
          "sample": sample, "app_count": len(scope), "top": top, "health": health, "attribution": attribution,
          "mysql": mres, "mysql_slow": mslow, "oom": oom, "redis": redis, "varnish": varnish,
          "server_findings": srv_find, "internal": internal, "customer": customer}
