@@ -32,10 +32,10 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 
 ## What the report contains
 
-1. Investigation Overview
+1. Investigation Overview, followed by a **HIGH PRIORITY FINDINGS** block: every CRITICAL/HIGH finding (and the top WARNINGs), each with application, key metrics, evidence and next action
 2. Overall Server Health: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, the CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
 3. Top N resource-consuming applications, with profile tags: High CPU, High Memory, Many FPM workers, Low traffic / high cost
-4. Application Traffic Analysis: requests, req/min and req/s, unique IPs, top IPs/URLs/User-Agents, status codes, static vs dynamic, WordPress REST/admin-ajax/wp-login/xmlrpc/wp-cron, WooCommerce, bots, attack indicators
+4. Application Traffic Analysis: requests, req/min and req/s, unique IPs, top IPs/URLs/User-Agents, status codes, static vs dynamic, WordPress REST/admin-ajax/wp-login/xmlrpc/wp-cron, WooCommerce, attack indicators, and a per-app **Bot & crawler analysis**
 5. PHP-FPM Investigation: pool config, live and peak workers, listen queue, max_children hits, timeouts, duration percentiles, CPU ms/request, memory per request, slowest paths and slow-log functions
 6. MySQL / MariaDB Investigation: connections, query rates, lock waits, deadlocks, slow-query fingerprints per database/app, running queries per database
 7. Application-Level Bottlenecks: findings, each with numeric evidence, severity, a confidence level and a recommended next action
@@ -43,7 +43,7 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 9. Internal PlatformOps Recommendations, each with the evidence that triggered it
 10. Customer-Shareable Recommendations, in a copy-paste block
 11. Evidence and Supporting Logs
-12. Final Investigation Summary
+12. Final Investigation Summary: a consolidated table of Finding / Application / Severity / Recommended action, most severe first
 
 ## Options
 
@@ -60,9 +60,49 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 | `--explain` | opt-in read-only `EXPLAIN` for suspected full-scan SELECTs |
 | `--long-request-seconds N` | live: an FPM worker busy continuously this long counts as a long-running request (default 10) |
 | `--pool-conf-glob G` | comma-separated globs for PHP-FPM pool configs (default `/etc/php/*/fpm/pool.d/*.conf,/etc/php-fpm.d/*.conf`) |
+| `--no-dns-verify` | skip reverse/forward DNS verification of claimed search-engine bots |
+| `--dns-verify-max N` | max IPs DNS-verified per run (default 60) |
+| `--bot-share-high` / `--bot-share-warn` | bot share of backend requests rated HIGH / WARNING (default 25% / 10%) |
+| `--cpu-high` / `--cpu-critical` / `--mem-high` | app severity thresholds as % of server capacity / RAM (default 40 / 70 / 30) |
+| `--php-rpm-per-core-warn` | PHP requests/min per vCPU considered high volume (default 120) |
 | `--help`, `--version` | usage and version |
 
 `--skip-health` is kept from the traffic analyzer for compatibility. Here it skips Redis/Varnish/OOM/filesystem checks; the WP health manager is never run. `--no-ip-lookup` is accepted and ignored, because this tool never sends visitor IPs to a third party.
+
+## Bot & crawler analysis
+
+Each top application gets a bot table (Bot, Category, Requests, Share, /min, IPs, Dynamic %, est. PHP CPU, Status). HIGH and WARNING bots also get their top IPs, URLs, status codes and DNS verification result.
+
+- **Identification:** about 50 signatures plus a generic `*bot|crawler|spider` fallback, in five categories:
+  1. verified search engines
+  2. commercial SEO crawlers (AhrefsBot, SemrushBot, MJ12bot, DotBot…)
+  3. AI crawlers (GPTBot, ClaudeBot, Bytespider, CCBot, PerplexityBot…)
+  4. other automated bots (monitors, social previews, scripts, scanners)
+  5. unknown or suspicious (empty User-Agent, outdated/spoofed browser User-Agents, impersonators)
+- **Verification:** claimed Googlebot/Bingbot/Applebot/Yandex/Baidu/Petal/Seznam (and Ahrefs/Semrush) IPs are checked with reverse DNS, then forward DNS. This uses the server's own resolver, never a third-party API, and is bounded by `--dns-verify-max` and 4 s timeouts. A wrong domain, a forward mismatch or no PTR record means **impersonation**. A timeout or resolver error is *inconclusive*; it is never taken as impersonation.
+- **Cost attribution:** each bot's PHP requests and CPU are **estimated** by joining its client IPs with `php-app.access.log`. That log records the client IP and per-request CPU, but not the User-Agent.
+- **Rating:** a bot that mostly fetches static or cached files is never rated HIGH, and its finding is INFO. Verified search engines are only HIGH if they drive ≥40% of the app's PHP CPU, and the advice is to tune their crawl rate, never to block them. Named crawlers are kept out of the attack heuristics, so a busy AhrefsBot is "bot traffic", not "DDoS".
+- **Suspicious patterns:**
+  - dominant IP or /24, or high per-IP rate
+  - wp-login and xmlrpc POST floods
+  - wp-admin hammering from one IP
+  - 403/404 scanning
+  - heavy REST or WooCommerce Store API use
+  - spoofed or headless User-Agents
+  - search-engine impersonation
+- **No per-bot MySQL attribution:** this would need per-request database data, so the report says so explicitly.
+
+## Severity model
+
+| Level | Colour | Meaning |
+|---|---|---|
+| CRITICAL | red | confirmed service-impacting bottleneck or serious abnormal activity (OOM kills, queued FPM requests, ≥10 max_children hits, ≥30 min of slow queries/hour, app ≥70% of a saturated server) |
+| HIGH | orange | significant consumption or strong bottleneck evidence |
+| WARNING | yellow | elevated usage or a developing issue |
+| INFO | blue | observation without an identified problem |
+| HEALTHY | green | nothing significant |
+
+Severity is set in one calibration pass that takes into account server size (shares of total capacity and requests per vCPU), sample length (live-only findings are capped at WARNING when `--sample-seconds` < 60) and whether the pressure is sustained (atop history versus a single sample). All thresholds are flags.
 
 ## Data sources (in order of trust)
 
@@ -178,6 +218,8 @@ This excerpt is from the synthetic test fixture (`tests/mkfix.py`), run on macOS
 - **The listen queue is only measured live,** through `ss`. Historical saturation comes from the "max_children reached" warnings in the FPM master log.
 - **Peak concurrency in the window is an estimate,** derived from busy worker-seconds per second.
 - **As non-root,** MySQL, atop, PSS, pool overrides and some logs are unavailable. The report lists each one.
+- **Bot PHP cost is estimated by client IP.** Humans and bots sharing an IP (NAT, proxies) blur it. Cloudflare-proxied sites need the real client IP in the logs, which Cloudways normally provides.
+- **DNS verification covers engines with published reverse-DNS domains.** DuckDuckBot, MJ12bot and most AI crawlers can't be verified this way and are labelled by User-Agent only.
 - **Traffic analysis needs the Cloudways log layout** (`<app>/logs/backend_*.access.log` or the nginx access/status logs).
 
 ## Testing results
@@ -188,12 +230,16 @@ What was actually run (2026-11-12):
 |---|---|---|
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
-| `tests/test_matrix.py` (17 checks) | macOS, synthetic | **17/17 pass** |
-| ↳ 121 apps, run time | | 4.6 s |
+| `tests/test_matrix.py` (23 checks) | macOS, synthetic | **23/23 pass** |
+| ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
 | ↳ low-traffic / high-CPU app ranked #1, root cause = optimization | | pass |
 | ↳ xmlrpc flood → suspicious; busy legitimate app → not suspicious | | pass |
 | ↳ nginx-only app (no backend log), app with no logs, unreadable log, hidden dir | | pass, no crash |
+| ↳ AhrefsBot on dynamic pages → SEO crawler, HIGH, ~94% of app PHP CPU by IP, root cause "bot traffic driving PHP" | | pass |
+| ↳ Googlebot fetching only static files → not HIGH, <5% PHP CPU, INFO finding | | pass |
+| ↳ alert block and final findings table rendered | | pass |
+| DNS verification with a stubbed resolver: genuine, wrong domain, suffix trick, forward mismatch, no PTR, timeout (must not count as impersonation) | unit test | pass |
 | ↳ credentials never printed; Markdown file has no ANSI codes; every finding has a next action | | pass |
 | Live, root | 1-vCPU Debian 12 Cloudways server, 10 apps, PHP 8.3/8.4, MariaDB 11.4, atop | pass, 26–28 s; all collectors working |
 | Live, non-root | same server, unprivileged user | pass; MySQL/atop/PSS/FPM logs reported as unavailable, no crash |
@@ -203,7 +249,7 @@ What was actually run (2026-11-12):
 ## Development
 
 ```bash
-tests/run_tests.sh      # offline: parsers, RCA scenarios, end-to-end report, 17-check scenario matrix
+tests/run_tests.sh      # offline: parsers, DNS-verify stubs, RCA scenarios, end-to-end report, 23-check scenario matrix
 ```
 
 `tests/mkfix.py` generates a synthetic Cloudways applications root with three cases: a slow-plugin app, a normal busy shop, and a wp-login brute-force target. To test changes on a real server without copying files, push a branch and run:

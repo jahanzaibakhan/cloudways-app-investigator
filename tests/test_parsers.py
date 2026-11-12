@@ -54,3 +54,26 @@ script_filename = /home/1/abc/public_html/index.php
 app={"fpm_slow_logs":[ss]}
 s = cw.analyze_slowlog(C(), app, datetime(2026,11,12,9,0), datetime(2026,11,12,10,0))
 print("phpslow", s["entries"], s["components"], s["functions"])
+# --- bot verification with a stubbed resolver (no network)
+args = cw.build_parser().parse_args([])
+v = cw.BotVerifier(cw.Ctx(args))
+fake = {"66.249.66.1": ("crawl-66-249-66-1.googlebot.com", ["66.249.66.1"]),
+        "185.220.101.5": ("tor-exit.example.net", ["185.220.101.5"]),
+        "1.2.3.4": ("crawl.googlebot.com.evil.net", ["1.2.3.4"]),          # suffix trick
+        "5.6.7.8": ("crawl-1.googlebot.com", ["9.9.9.9"])}                   # forward mismatch
+def _fake(ip):
+    if ip == "7.7.7.7":
+        raise TimeoutError("resolver down")
+    if ip == "8.8.4.9":
+        raise cw.socket.herror(1, "Unknown host")
+    return fake[ip]
+v._lookup = _fake
+r = v.verify("Googlebot", (".googlebot.com", ".google.com"), ["66.249.66.1"])
+assert r["status"] == "verified", r
+r = v.verify("Googlebot", (".googlebot.com",), ["185.220.101.5", "1.2.3.4", "5.6.7.8"])
+assert r["status"].startswith("IMPERSONATION") and r["failed"] == 3, r
+r = v.verify("Googlebot", (".googlebot.com",), ["7.7.7.7"])
+assert r["failed"] == 0 and r["unknown"] == 1 and not r["status"].startswith("IMPERSONATION"), r   # timeout != impersonation
+r = v.verify("Googlebot", (".googlebot.com",), ["8.8.4.9"])
+assert r["failed"] == 1, r                                                                        # no PTR = failed
+print("dns-verify ok")

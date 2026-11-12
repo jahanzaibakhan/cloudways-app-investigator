@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -1040,6 +1040,7 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
     status = Counter()
     over = Counter()
     heap_cpu, heap_dur, heap_mem = [], [], []
+    ip_stats: dict[str, list] = {}
     seq = 0
     for f in files:
         for line in iter_lines(f, start, access_line_ts):
@@ -1067,6 +1068,14 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
             if not deep:
                 continue
             durations.append(dur)
+            ipst = ip_stats.get(m["ip"])
+            if ipst is None:
+                if len(ip_stats) < 300000:
+                    ip_stats[m["ip"]] = [1, cpu_s, dur]
+            else:
+                ipst[0] += 1
+                ipst[1] += cpu_s
+                ipst[2] += dur
             minute = ts.replace(second=0)
             per_min[minute] += 1
             s0 = int(ts.replace(tzinfo=timezone.utc).timestamp())
@@ -1114,6 +1123,7 @@ def analyze_fpm_access(ctx: Ctx, app: dict, start, end, deep: bool) -> dict:
         res["peak_concurrency"] = round(peak, 1)
         res["peak_concurrency_at"] = datetime.fromtimestamp(peak_at, timezone.utc).strftime("%H:%M:%S") if peak_at else ""
         res["types"] = types.most_common()
+        res["_ip_stats"] = ip_stats
         top = sorted(paths.items(), key=lambda kv: -kv[1][1])[:10]
         res["top_paths_cpu"] = [{"path": trunc(k, 70), "hits": v[0], "cpu_s": round(v[1], 1),
                                  "avg_s": round(v[2] / v[0], 3), "max_s": round(v[3], 2), "max_mb": round(v[4], 1)}
@@ -1305,6 +1315,160 @@ def scan_oom(ctx: Ctx, start, end) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Bot identification & verification
+# ----------------------------------------------------------------------------
+# (regex on User-Agent, display name, category, DNS suffixes for verification or None)
+# Categories: search | seo | ai | monitor | social | automation | other-bot
+BOT_SIGNATURES = [
+    (r"googlebot|google-inspectiontool|googleother|adsbot-google|mediapartners-google|storebot-google", "Googlebot", "search",
+     (".googlebot.com", ".google.com", ".googleusercontent.com")),
+    (r"bingbot|msnbot|bingpreview|adidxbot", "Bingbot", "search", (".search.msn.com",)),
+    (r"applebot(?!-extended)", "Applebot", "search", (".applebot.apple.com",)),
+    (r"yandex(?:bot|images|mobilebot|metrika|accessibilitybot|renderresourcesbot)", "YandexBot", "search",
+     (".yandex.ru", ".yandex.net", ".yandex.com")),
+    (r"baiduspider", "Baiduspider", "search", (".baidu.com", ".baidu.jp")),
+    (r"petalbot", "PetalBot", "search", (".petalsearch.com", ".aspiegel.com")),
+    (r"duckduckbot|duckassistbot", "DuckDuckBot", "search", None),
+    (r"seznambot", "SeznamBot", "search", (".seznam.cz",)),
+    (r"ahrefs(?:bot|siteaudit)", "AhrefsBot", "seo", (".ahrefs.com", ".ahrefs.net")),
+    (r"semrushbot|siteauditbot|splitsignalbot", "SemrushBot", "seo", (".semrush.com",)),
+    (r"mj12bot", "MJ12bot", "seo", None),
+    (r"dotbot", "DotBot", "seo", None),
+    (r"blexbot", "BLEXBot", "seo", None),
+    (r"dataforseobot", "DataForSeoBot", "seo", None),
+    (r"barkrowler", "Barkrowler", "seo", None),
+    (r"serpstatbot", "SerpstatBot", "seo", None),
+    (r"screaming frog", "Screaming Frog", "seo", None),
+    (r"rogerbot|moz\.com", "Moz rogerbot", "seo", None),
+    (r"megaindex|seokicks|linkdexbot|seekport|sistrix|oncrawl|lumar|deepcrawl|ryte", "SEO crawler (other)", "seo", None),
+    (r"gptbot", "GPTBot (OpenAI)", "ai", None),
+    (r"chatgpt-user|oai-searchbot", "ChatGPT-User/OAI-SearchBot", "ai", None),
+    (r"claudebot|claude-web|claude-user|claude-searchbot|anthropic-ai", "ClaudeBot (Anthropic)", "ai", None),
+    (r"perplexitybot|perplexity-user", "PerplexityBot", "ai", None),
+    (r"bytespider", "Bytespider (ByteDance)", "ai", None),
+    (r"ccbot", "CCBot (Common Crawl)", "ai", None),
+    (r"amazonbot", "Amazonbot", "ai", None),
+    (r"meta-externalagent|meta-externalfetcher|facebookbot", "Meta AI crawler", "ai", None),
+    (r"cohere-ai|cohere-training", "Cohere", "ai", None),
+    (r"diffbot", "Diffbot", "ai", None),
+    (r"youbot|imagesiftbot|timpibot|pangubot|kangaroo bot|omgili|ai2bot|duckassist|mistralai-user", "AI crawler (other)", "ai", None),
+    (r"facebookexternalhit|facebookcatalog", "Facebook preview", "social", None),
+    (r"twitterbot|linkedinbot|slackbot|whatsapp|telegrambot|discordbot|pinterestbot|skypeuripreview|redditbot", "Social preview bot", "social", None),
+    (r"uptimerobot", "UptimeRobot", "monitor", None),
+    (r"pingdom", "Pingdom", "monitor", None),
+    (r"statuscake|site24x7|betteruptime|better uptime|hetrixtools|freshping|uptime-kuma|nodeping|updown\.io|datadog|newrelicpinger|monitis", "Uptime monitor", "monitor", None),
+    (r"jetpack", "Jetpack", "monitor", None),
+    (r"gtmetrix|chrome-lighthouse|pagespeed|webpagetest", "Performance tester", "monitor", None),
+    (r"wordpress/\d", "WordPress loopback/cron", "automation", None),
+    (r"woocommerce", "WooCommerce webhook/API client", "automation", None),
+    (r"headlesschrome|phantomjs|puppeteer|playwright|selenium|chromedriver", "Headless browser", "automation", None),
+    (r"python-requests|python-urllib|aiohttp|httpx|scrapy", "Python script/scraper", "automation", None),
+    (r"curl/", "curl", "automation", None),
+    (r"wget/", "wget", "automation", None),
+    (r"go-http-client", "Go HTTP client", "automation", None),
+    (r"okhttp|java/|apache-httpclient|jakarta", "Java/Android HTTP client", "automation", None),
+    (r"node-fetch|axios|undici|got \(", "Node.js HTTP client", "automation", None),
+    (r"guzzlehttp|php/\d", "PHP HTTP client", "automation", None),
+    (r"libwww-perl|lwp::", "Perl script", "automation", None),
+    (r"masscan|zgrab|nmap|nikto|sqlmap|wpscan|nuclei|censysinspect|expanse|internet-measurement|paloalto", "Vulnerability scanner", "automation", None),
+]
+BOT_RES = [(re.compile(rx, re.I), name, cat, dns) for rx, name, cat, dns in BOT_SIGNATURES]
+GENERIC_BOT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_.-]*(?:bot|crawler|spider|scraper)[A-Za-z0-9_.-]*)", re.I)
+BOT_CATEGORY_LABEL = {
+    "search": "Search engine", "seo": "Commercial SEO crawler", "ai": "AI crawler", "monitor": "Monitoring",
+    "social": "Social preview", "automation": "Automated client", "other-bot": "Other bot",
+    "suspicious": "Unknown / suspicious",
+}
+_bot_cache: dict = {}
+
+
+def identify_bot(ua: str):
+    """Return (name, category, dns_suffixes) or None for browser-like traffic."""
+    hit = _bot_cache.get(ua)
+    if hit is not None or ua in _bot_cache:
+        return hit
+    res = None
+    if not ua or ua == "-":
+        res = ("(empty User-Agent)", "suspicious", None)
+    else:
+        for rx, name, cat, dns in BOT_RES:
+            if rx.search(ua):
+                res = (name, cat, dns)
+                break
+        if res is None:
+            m = GENERIC_BOT_RE.search(ua)
+            if m and "cubot" not in ua.lower():           # Cubot is a phone brand
+                res = (trunc(m.group(1), 30), "other-bot", None)
+    if len(_bot_cache) < 50000:
+        _bot_cache[ua] = res
+    return res
+
+
+class BotVerifier:
+    """Reverse+forward DNS verification of claimed search-engine bots (bounded, with timeouts)."""
+
+    def __init__(self, ctx: Ctx):
+        self.ctx = ctx
+        self.enabled = not ctx.args.no_dns_verify
+        self.budget = ctx.args.dns_verify_max
+        self.cache: dict[str, tuple[str, str]] = {}
+
+    @staticmethod
+    def _lookup(ip: str):
+        host = socket.gethostbyaddr(ip)[0].lower().rstrip(".")
+        fwd = socket.gethostbyname_ex(host)[2] if ":" not in ip else \
+            [ai[4][0] for ai in socket.getaddrinfo(host, None, socket.AF_INET6)]
+        return host, fwd
+
+    def verify(self, bot: str, suffixes, ips: list[str]) -> dict:
+        res = {"verified": 0, "failed": 0, "unknown": 0, "checked": [], "status": "unverifiable"}
+        if not suffixes:
+            return res
+        if not self.enabled:
+            res["status"] = "not checked (--no-dns-verify)"
+            return res
+        todo = [ip for ip in ips if ip not in self.cache][: max(0, self.budget)]
+        if todo:
+            from concurrent.futures import ThreadPoolExecutor
+            ex = ThreadPoolExecutor(max_workers=8)
+            futs = {ip: ex.submit(self._lookup, ip) for ip in todo}
+            self.budget -= len(todo)
+            for ip, fu in futs.items():
+                try:
+                    host, fwd = fu.result(timeout=4)
+                    ok = host.endswith(tuple(suffixes)) and ip in fwd
+                    self.cache[ip] = ("verified" if ok else "failed", host)
+                except socket.herror:                       # no PTR record: definitive
+                    self.cache[ip] = ("failed-no-ptr", "")
+                except socket.gaierror as exc:              # forward lookup: only NONAME is definitive
+                    definitive = getattr(exc, "errno", None) in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", -999))
+                    self.cache[ip] = ("failed-no-forward" if definitive else "unknown-dns-error", "")
+                except Exception:   # noqa: BLE001 - timeout / resolver unavailable: NOT evidence of impersonation
+                    self.cache[ip] = ("unknown-timeout", "")
+            ex.shutdown(wait=False)
+        for ip in ips:
+            st, host = self.cache.get(ip, ("unknown", ""))
+            if st == "verified":
+                res["verified"] += 1
+            elif st.startswith("failed"):
+                res["failed"] += 1
+            else:
+                res["unknown"] += 1
+            res["checked"].append({"ip": ip, "result": st, "host": host or "-"})
+        if res["verified"] and not res["failed"]:
+            res["status"] = "verified"
+        elif res["failed"] and not res["verified"]:
+            res["status"] = "IMPERSONATION (DNS verification failed)"
+        elif res["failed"]:
+            res["status"] = "partially verified - some IPs impersonate"
+        elif res["unknown"] and self.budget > 0:
+            res["status"] = "inconclusive (DNS lookups timed out/failed)"
+        else:
+            res["status"] = "unchecked (DNS budget exhausted)"
+        return res
+
+
+# ----------------------------------------------------------------------------
 # Traffic analysis (backend = requests that passed Varnish to Apache/PHP)
 # ----------------------------------------------------------------------------
 def estimate_latest_chrome(now: datetime) -> int:
@@ -1351,6 +1515,9 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
     chrome_bad = headless = query = login_post = xmlrpc_post = 0
     ua_ips = defaultdict(set)
     unparsed = 0
+    bots: dict[str, dict] = {}
+    ip_err = Counter()
+    store_api = 0
     for f in files:
         for line in iter_lines(f, start, access_line_ts):
             m = ACCESS_RE.match(line)
@@ -1382,20 +1549,74 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
             if len(ua_ips) < 20000 or ua in ua_ips:
                 if len(ua_ips[ua]) < 5000:
                     ua_ips[ua].add(ip)
+            spoofed = False
             cm = CHROME_RE.search(ua)
             if cm:
                 v = int(cm.group(1))
                 if v > latest_chrome or v <= latest_chrome - ctx.args.chrome_obsolete_margin:
                     chrome_bad += 1
+                    spoofed = True
                 if "headless" in ua.lower():
                     headless += 1
             minute = ts.replace(second=0)
+            st = m["status"]
+            if st in ("403", "404"):
+                ip_err[ip] += 1
+            if "/wp-json/wc/store" in path or "rest_route=/wc/store" in uri:
+                store_api += 1
+            bot = identify_bot(ua)
+            if bot is None and spoofed and uc == "browser":
+                bot = ("Outdated/spoofed browser UA", "suspicious", None)
+            if bot:
+                b = bots.get(bot[0])
+                if b is None:
+                    b = bots[bot[0]] = {"name": bot[0], "category": bot[1], "dns": bot[2], "requests": 0, "dynamic": 0,
+                                        "ips": Counter(), "urls": Counter(), "status": Counter(), "per_min": Counter(),
+                                        "cats": Counter(), "ua_sample": trunc(ua, 120)}
+                b["requests"] += 1
+                if c != "static":
+                    b["dynamic"] += 1
+                if len(b["ips"]) < 20000 or ip in b["ips"]:
+                    b["ips"][ip] += 1
+                if len(b["urls"]) < 5000 or path in b["urls"]:
+                    b["urls"][trunc(path, 90)] += 1
+                b["status"][st] += 1
+                b["per_min"][minute] += 1
+                b["cats"][c] += 1
             per_min[minute] += 1
             per_sec[ts] += 1 if len(per_sec) < 400000 else 0
     total = res["total"]
     res["unparsed"] = unparsed
     if not total:
         return res
+    win_min = max((end - start).total_seconds() / 60, 1) if (end and start) else max(1, len(per_min))
+    bot_rows = []
+    for b in sorted(bots.values(), key=lambda x: -x["requests"]):
+        n = b["requests"]
+        bot_rows.append({
+            "name": b["name"], "category": b["category"], "dns": list(b["dns"]) if b["dns"] else None,
+            "requests": n, "pct": pct(n, total), "rpm": n / win_min,
+            "peak_rpm": max(b["per_min"].values()) if b["per_min"] else 0,
+            "unique_ips": len(b["ips"]), "top_ips": b["ips"].most_common(5),
+            "top_urls": b["urls"].most_common(5), "status": b["status"].most_common(6),
+            "dynamic": b["dynamic"], "static": n - b["dynamic"], "cats": dict(b["cats"]),
+            "err_4xx": sum(v for k, v in b["status"].items() if k.startswith("4")),
+            "ua_sample": b["ua_sample"], "all_ips": dict(b["ips"].most_common(2000)),
+        })
+    res["bots"] = bot_rows
+    res["_ip_totals"] = {ip: ips[ip] for b in bot_rows for ip in b["all_ips"]}
+    res["bot_requests"] = sum(b["requests"] for b in bot_rows)
+    res["bot_dynamic"] = sum(b["dynamic"] for b in bot_rows)
+    res["bot_by_category"] = Counter()
+    for b in bot_rows:
+        res["bot_by_category"][b["category"]] += b["requests"]
+    res["bot_by_category"] = res["bot_by_category"].most_common()
+    res["store_api"] = store_api
+    res["err_403"] = status.get("403", 0)
+    res["err_404"] = status.get("404", 0)
+    res["top_err_ips"] = ip_err.most_common(3)
+    adm = Counter({ip: c["wp-admin"] + c["admin-ajax"] for ip, c in ip_cats.items() if c.get("wp-admin") or c.get("admin-ajax")})
+    res["top_admin_ip"] = adm.most_common(1)[0] if adm else None
     for ip, n in ips.items():
         sn = subnet_of(ip)
         if sn:
@@ -1426,12 +1647,20 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
     })
     # Frontend (nginx) totals give the full picture incl. Varnish/static hits.
     if src == "backend" and app["frontend_logs"]:
-        ftotal = 0
+        ftotal, fbots = 0, Counter()
         for f in files_for_window(app["frontend_logs"], start):
             for line in iter_lines(f, start, access_line_ts):
-                if in_window(access_line_ts(line), start, end):
-                    ftotal += 1
+                if not in_window(access_line_ts(line), start, end):
+                    continue
+                ftotal += 1
+                q = line.rfind('"', 0, len(line) - 1)
+                fua = line[q + 1:-1] if q > 0 and line.endswith('"') else "-"
+                fb = identify_bot(fua)
+                if fb:
+                    fbots[fb[0]] += 1
         res["frontend_total"] = ftotal
+        for b in res["bots"]:
+            b["frontend"] = fbots.get(b["name"], 0)
     return res
 
 
@@ -1441,13 +1670,22 @@ def traffic_signals(t: dict) -> list[dict]:
     total = t.get("total", 0)
     if total < 200:
         return sig
-    if t["top_ips"] and t["top_ips"][0]["pct"] >= 25 and t["top_ips"][0]["requests"] >= 300:
+    # Traffic from identified, non-impersonated crawlers is judged by the bot analysis, not the attack heuristics.
+    named_ips, named_subnets = set(), Counter()
+    for b in t.get("bots", []):
+        if b["category"] in ("search", "seo", "ai", "monitor", "social") and not b.get("impersonation"):
+            for ip, n in b["top_ips"]:
+                named_ips.add(ip)
+            named_subnets.update({subnet_of(ip): n for ip, n in b["top_ips"]})
+    top_is_named = bool(t["top_ips"]) and t["top_ips"][0]["ip"] in named_ips
+    if t["top_ips"] and t["top_ips"][0]["pct"] >= 25 and t["top_ips"][0]["requests"] >= 300 and not top_is_named:
         ip = t["top_ips"][0]
         sig.append({"key": "dominant_ip", "text": f"Single IP {ip['ip']} sent {ip['requests']:,} requests "
                     f"({ip['pct']:.1f}% of backend traffic), mostly '{ip['top_target']}'"})
     top_ip_n = t["top_ips"][0]["requests"] if t["top_ips"] else 0
+    sn_named = t["top_subnets"] and named_subnets.get(t["top_subnets"][0]["subnet"], 0) > 0
     if t["top_subnets"] and t["top_subnets"][0]["pct"] >= 40 and t["top_subnets"][0]["requests"] >= 500 and \
-            t["top_subnets"][0]["requests"] - top_ip_n >= 0.2 * total:
+            t["top_subnets"][0]["requests"] - top_ip_n >= 0.2 * total and not sn_named:
         s = t["top_subnets"][0]
         sig.append({"key": "dominant_subnet", "text": f"Subnet {s['subnet']} sent {s['requests']:,} requests ({s['pct']:.1f}%)"})
     if t["spike_ratio"] >= 6 and t["peak_rpm"] >= 120:
@@ -1457,9 +1695,11 @@ def traffic_signals(t: dict) -> list[dict]:
         sig.append({"key": "login_bruteforce", "text": f"{t['login_post']:,} POST requests to wp-login.php"})
     if t["xmlrpc_post"] >= 100:
         sig.append({"key": "xmlrpc_abuse", "text": f"{t['xmlrpc_post']:,} POST requests to xmlrpc.php"})
-    bots = dict(t["ua_classes"]).get("bot/tool", 0) + dict(t["ua_classes"]).get("empty", 0)
-    if pct(bots, total) >= 40:
-        sig.append({"key": "bot_share", "text": f"{pct(bots, total):.0f}% of requests come from non-search bots/tools or empty User-Agents"})
+    bc = dict(t.get("bot_by_category", []))
+    unnamed = bc.get("automation", 0) + bc.get("other-bot", 0) + bc.get("suspicious", 0)
+    if pct(unnamed, total) >= 40:
+        sig.append({"key": "bot_share", "text": f"{pct(unnamed, total):.0f}% of requests come from unidentified bots, scripts or "
+                    "empty/spoofed User-Agents"})
     if pct(t["chrome_suspicious"] + t["headless"], total) >= 20:
         sig.append({"key": "spoofed_ua", "text": f"{t['chrome_suspicious'] + t['headless']:,} requests use obsolete/non-existent "
                     "Chrome versions or HeadlessChrome (spoofed UA indicator)"})
@@ -1470,6 +1710,32 @@ def traffic_signals(t: dict) -> list[dict]:
             sig.append({"key": "distributed_same_ua", "text": f"{u['pct']:.0f}% of requests share one User-Agent across "
                         f"{u['ips']:,} IPs (distributed client indicator): {trunc(u['ua'], 60)}"})
             break
+    errs = t.get("err_403", 0) + t.get("err_404", 0)
+    if errs >= 300 and pct(errs, total) >= 20:
+        ip_e = t.get("top_err_ips") or []
+        sig.append({"key": "error_scan", "text": f"{errs:,} 403/404 responses ({pct(errs, total):.0f}%)"
+                    + (f"; top source {ip_e[0][0]} ({ip_e[0][1]:,})" if ip_e else "") + " - scanning/probing indicator"})
+    adm = t.get("top_admin_ip")
+    if adm and adm[1] >= 300:
+        sig.append({"key": "admin_hammer", "text": f"{adm[0]} made {adm[1]:,} wp-admin/admin-ajax requests"})
+    cats = dict(t["categories"])
+    rest = cats.get("rest-api", 0) + cats.get("wc-rest", 0)
+    if rest >= 2000 and pct(rest, total) >= 40:
+        sig.append({"key": "rest_heavy", "text": f"{rest:,} WordPress REST API requests ({pct(rest, total):.0f}% of backend traffic)"})
+    if t.get("store_api", 0) >= 1000:
+        sig.append({"key": "store_api", "text": f"{t['store_api']:,} WooCommerce Store API requests (/wp-json/wc/store)"})
+    for b in t.get("bots", []):
+        if b.get("impersonation") and b["requests"] >= 50:
+            bad = [c for c in b["verification"]["checked"] if c["result"].startswith("failed")]
+            sig.append({"key": "impersonation", "text": f"{b['requests']:,} requests claim to be {b['name']} but "
+                        f"{len(bad)} of {len(b['verification']['checked'])} checked IPs fail reverse/forward DNS "
+                        f"(e.g. {bad[0]['ip']} -> {bad[0]['host'] or 'no PTR'})"})
+            break
+    win_min = max(t.get("active_minutes") or 1, 1)
+    if t["top_ips"] and t["top_ips"][0]["requests"] / win_min >= 60 and not top_is_named and \
+            not any(x["key"] == "dominant_ip" for x in sig):
+        ip = t["top_ips"][0]
+        sig.append({"key": "ip_rate", "text": f"{ip['ip']} averaged {ip['requests'] / win_min:.0f} req/min over active minutes"})
     if t["query_pct"] >= 60 and t["dynamic"] >= 1000:
         sig.append({"key": "cache_bypass", "text": f"{t['query_pct']:.0f}% of requests carry query strings (possible cache-bypass)"})
     return sig
@@ -1844,6 +2110,49 @@ def varnish_info(ctx: Ctx) -> dict | None:
             "since": "service start"}
 
 
+def correlate_bots(ctx: Ctx, verifier, p: dict):
+    """Verify claimed search bots and estimate each bot's PHP requests / CPU via client IP."""
+    t, fa = p.get("traffic") or {}, p.get("fpm") or {}
+    bots = t.get("bots") or []
+    ip_stats, ip_tot = fa.get("_ip_stats") or {}, t.get("_ip_totals") or {}
+    total_cpu = fa.get("cpu_s") or 0.0
+    total_php = fa.get("requests") or 0
+    for b in bots:
+        if b["category"] == "search" and b.get("dns"):
+            ips = [ip for ip, _ in b["top_ips"]]
+            b["verification"] = verifier.verify(b["name"], b["dns"], ips)
+            st = b["verification"]["status"]
+            if st == "verified":
+                b["category_label"] = "Search engine (verified)"
+            elif st.startswith("IMPERSONATION"):
+                b["category_label"] = "IMPERSONATION of " + b["name"]
+                b["impersonation"] = True
+            elif st.startswith("partially"):
+                b["category_label"] = "Search engine (partly impersonated)"
+                b["impersonation"] = True
+            else:
+                b["category_label"] = "Search engine (unverified)"
+        else:
+            b["category_label"] = BOT_CATEGORY_LABEL.get(b["category"], b["category"])
+        php_n = cpu = 0.0
+        if ip_stats:
+            for ip, n in b["all_ips"].items():
+                st = ip_stats.get(ip)
+                if not st:
+                    continue
+                share = n / max(ip_tot.get(ip, n), n)
+                php_n += st[0] * share
+                cpu += st[1] * share
+        b["php_requests_est"] = round(php_n)
+        b["php_cpu_s_est"] = round(cpu, 1)
+        b["php_cpu_share"] = pct(cpu, total_cpu)
+        b["php_req_share"] = pct(php_n, total_php)
+        b.pop("all_ips", None)
+    t.pop("_ip_totals", None)
+    fa.pop("_ip_stats", None)
+    t["bot_php_cpu_share"] = sum(b["php_cpu_share"] for b in bots)
+
+
 # ----------------------------------------------------------------------------
 # Profiles & ranking
 # ----------------------------------------------------------------------------
@@ -1921,6 +2230,11 @@ CONF_ORDER = {"Confirmed": 0, "Likely": 1, "Suspected": 2, "Inconclusive": 3}
 
 # (substring of finding text, recommended next action). First match wins.
 NEXT_ACTIONS = [
+    ("HIGH BOT TRAFFIC", "Review the flagged crawlers: rate-limit or block aggressive SEO/AI bots (Cloudflare bot rules, robots.txt); never block verified search engines - tune their crawl rate instead."),
+    ("Elevated bot traffic", "Monitor the flagged crawlers; consider crawl-delay/rate limits for SEO/AI bots if PHP load grows."),
+    ("static/cached content", "No PHP impact; only act if bandwidth or CDN cost is a concern."),
+    ("Bot impersonation", "Treat as unverified automated traffic: rate-limit or block the listed IPs at Cloudflare/WAF; real search engines are unaffected."),
+    ("High backend/PHP request volume", "Check cache hit ratio (Varnish/page cache) and whether the dynamic requests are bots or real users."),
     ("Application is a top consumer", "Confirm with the per-app process list and the CPU source shown; compare against the window average before acting."),
     ("proportional to legitimate PHP traffic", "Check whether resource pressure is sustained (atop history); if so evaluate upscaling, otherwise monitor peak hours."),
     ("disproportionate to traffic", "Profile the top CPU paths (New Relic/Xdebug/Query Monitor); review plugins, theme and custom code on those URLs."),
@@ -1971,9 +2285,31 @@ def next_action_for(text: str) -> str:
     return ""
 
 
-def F(area, severity, confidence, text, evidence=None, scenario=None, action=None):
+def F(area, severity, confidence, text, evidence=None, scenario=None, action=None, metrics=None):
     return {"area": area, "severity": severity, "confidence": confidence, "text": text,
-            "evidence": evidence or [], "scenario": scenario, "action": action or next_action_for(text)}
+            "evidence": evidence or [], "scenario": scenario, "action": action or next_action_for(text),
+            "metrics": metrics or []}
+
+
+SEV_ORDER = {"critical": 0, "high": 1, "warning": 2, "info": 3, "ok": 4}
+
+
+def bot_level(ctx: Ctx, b: dict, t: dict) -> str:
+    """HIGH / WARNING / NORMAL for one bot, using traffic share AND PHP cost, not request count alone."""
+    a = ctx.args
+    if b["requests"] < 200:
+        return "NORMAL"
+    share, cpu = b["pct"], b.get("php_cpu_share", 0.0)
+    if b["category"] == "monitor" or b["name"].startswith("WordPress loopback"):
+        return "WARNING" if share >= 50 else "NORMAL"
+    if b.get("category_label") == "Search engine (verified)":
+        return "HIGH" if cpu >= 40 else "WARNING" if (share >= 40 or cpu >= 20) else "NORMAL"
+    mostly_static = pct(b["dynamic"], b["requests"]) < 20 and cpu < 10
+    if share >= a.bot_share_high or cpu >= 25:
+        return "WARNING" if mostly_static and not b.get("impersonation") else "HIGH"
+    if share >= a.bot_share_warn or cpu >= 10 or b.get("impersonation"):
+        return "WARNING"
+    return "NORMAL"
 
 
 def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
@@ -2005,7 +2341,9 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
     # --- Traffic correlation
     php_rpm = p["php_requests"] / (window_h * 60) if window_h else 0
     suspicious = None
-    if len(sig) >= 3 or (len(sig) >= 2 and any(s["key"] in ("dominant_ip", "dominant_subnet", "login_bruteforce", "xmlrpc_abuse") for s in sig)):
+    strong = ("dominant_ip", "dominant_subnet", "login_bruteforce", "xmlrpc_abuse", "impersonation", "admin_hammer", "error_scan")
+    weak_only = all(x["key"] in ("rest_heavy", "store_api", "cache_bypass") for x in sig)
+    if not weak_only and (len(sig) >= 3 or (len(sig) >= 2 and any(x["key"] in strong for x in sig))):
         conf = "Likely" if len(sig) >= 3 else "Suspected"
         suspicious = conf
         fnd.append(F("traffic", "critical" if conf == "Likely" else "warning", conf,
@@ -2127,12 +2465,49 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
                      "Long-running query" + (" (backup dump)" if q["dump"] else ""),
                      [f"{q['time_s']}s, state '{q['state']}': {trunc(q['query'], 110)}"]))
 
+    # --- Bots
+    bot_rows = t.get("bots") or []
+    flagged = []
+    for b in bot_rows:
+        level = bot_level(ctx, b, t)
+        b["level"] = level
+        if level in ("HIGH", "WARNING"):
+            flagged.append(b)
+    if flagged:
+        worst = "high" if any(b["level"] == "HIGH" for b in flagged) else "warning"
+        cpu_bots = sum(b["php_cpu_share"] for b in flagged)
+        ev = []
+        for b in flagged[:4]:
+            dyn = pct(b["dynamic"], b["requests"])
+            ev.append(f"{b['name']} [{b.get('category_label', b['category'])}]: {b['requests']:,} req ({b['pct']:.0f}% of backend), "
+                      f"{b['rpm']:.0f}/min, {b['unique_ips']} IPs, {dyn:.0f}% dynamic, est. {b['php_cpu_share']:.0f}% of app PHP CPU"
+                      + (" - mostly static/cached, not driving PHP" if dyn < 20 else ""))
+        drives = hi_cpu and cpu_bots >= 30
+        static_only = cpu_bots < 10 and all(pct(b["dynamic"], b["requests"]) < 20 for b in flagged)
+        if static_only:
+            worst = "info"
+        fnd.append(F("bots", worst, "Likely" if drives else "Confirmed",
+                     "HIGH BOT TRAFFIC DETECTED" if worst == "high" else
+                     "High bot request volume on static/cached content (not driving PHP)" if static_only else "Elevated bot traffic",
+                     ev + [f"Flagged bots account for an estimated {cpu_bots:.0f}% of this app's PHP CPU (attributed by client IP)"],
+                     scenario="bots" if drives else None,
+                     metrics=[("Bots", ", ".join(b["name"] for b in flagged[:3])),
+                              ("Requests", f"{sum(b['requests'] for b in flagged):,} ({sum(b['pct'] for b in flagged):.0f}% of backend)"),
+                              ("Est. PHP CPU", f"{cpu_bots:.0f}% of app")]))
+    for b in bot_rows:
+        if b.get("impersonation") and b["requests"] >= 20:
+            bad = [c for c in b["verification"]["checked"] if c["result"].startswith("failed")]
+            fnd.append(F("bots", "high", "Confirmed", f"Bot impersonation: traffic claiming to be {b['name']} fails DNS verification",
+                         [f"{b['requests']:,} requests; {len(bad)}/{len(b['verification']['checked'])} checked IPs failed"]
+                         + [f"{c['ip']} -> {c['host'] or 'no PTR record'}" for c in bad[:3]], scenario="suspicious"))
+
     # --- Errors
     if t.get("total", 0) >= 200 and pct(t.get("errors_5xx", 0), t["total"]) >= 5:
         fnd.append(F("traffic", "warning", "Confirmed", "Elevated 5xx error rate",
                      [f"{t['errors_5xx']:,} 5xx responses ({pct(t['errors_5xx'], t['total']):.1f}% of backend requests)"]))
 
-    fnd.sort(key=lambda f: ({"critical": 0, "warning": 1, "info": 2}[f["severity"]], CONF_ORDER[f["confidence"]]))
+    calibrate_app_severity(ctx, p, fnd, server)
+    fnd.sort(key=lambda f: (SEV_ORDER[f["severity"]], CONF_ORDER[f["confidence"]]))
     p["findings"] = fnd
     p["root_cause"] = decide_root_cause(p, fnd, server, suspicious)
     return p
@@ -2144,6 +2519,132 @@ def fmt_age(sec: int) -> str:
     if sec >= 3600:
         return f"{sec / 3600:.1f}h"
     return f"{sec // 60}m"
+
+
+def _has(f, *keys):
+    t = f["text"].lower()
+    return any(k.lower() in t for k in keys)
+
+
+def calibrate_app_severity(ctx: Ctx, p: dict, fnd: list, h: dict):
+    """Unified severity (critical/high/warning/info) using server capacity, sample length and evidence strength."""
+    a = ctx.args
+    fa, t = p.get("fpm") or {}, p.get("traffic") or {}
+    hist = (h or {}).get("history") or {}
+    srv_busy = (hist.get("cpu_busy") or (None,))[0]
+    srv_busy = srv_busy if srv_busy is not None else (h or {}).get("cpu_busy", 0)
+    short = a.sample_seconds < 60
+    saturated = any(_has(f, "worker exhaustion", "queued waiting") for f in fnd)
+
+    # Extra detectors that need the whole profile
+    fpm_procs = [x for x in p.get("top_procs", []) if x["what"].startswith("fpm:")]
+    hot = [x for x in fpm_procs if x["cpu"] >= 80]
+    if hot:
+        fnd.append(F("php-fpm", "high", "Confirmed", "High CPU from individual PHP-FPM processes",
+                     [f"PID {x['pid']} averaged {x['cpu']:.0f}% of a core over the {a.sample_seconds:.0f}s sample" for x in hot[:3]],
+                     action="Match the PID's busy period with the slowest requests/slow-log traces; check for loops or heavy imports."))
+    if fpm_procs and fpm_procs[0]["mem_kind"] == "PSS":
+        avg = sum(x["mem_mb"] for x in fpm_procs) / len(fpm_procs)
+        if avg >= 128:
+            fnd.append(F("php-fpm", "high" if avg >= 256 else "warning", "Confirmed", "Excessive PHP-FPM worker memory",
+                         [f"Average {avg:.0f} MB PSS per worker across {len(fpm_procs)} sampled worker(s)",
+                          f"pm.max_children={p.get('max_children') or '?'} -> worst case ~{fmt_mb(avg * (p.get('max_children') or 0))}"],
+                         action="Find memory-heavy requests (top memory URLs); size max_children to RAM / per-worker memory."))
+    win_min = max(getattr(a, "window_s", 3600) / 60, 1)
+    php_rpm_core = p["php_requests"] / win_min / NCPU
+    if php_rpm_core >= a.php_rpm_per_core_warn:
+        loaded = p["cpu_server_share"] >= a.cpu_threshold
+        fnd.append(F("traffic", ("high" if php_rpm_core >= a.php_rpm_per_core_warn * 2.5 else "warning") if loaded else "info",
+                     "Confirmed", "High backend/PHP request volume" + ("" if loaded else " (handled without resource pressure)"),
+                     [f"{p['php_requests']:,} PHP requests = {p['php_requests'] / win_min:.0f}/min ({php_rpm_core:.0f}/min per vCPU)",
+                      f"Backend requests: {t.get('total', 0):,}; bots {pct(t.get('bot_requests', 0), t.get('total') or 1):.0f}% of them"],
+                     metrics=[("PHP req/min", f"{p['php_requests'] / win_min:.0f}"), ("Per vCPU", f"{php_rpm_core:.0f}/min")]))
+
+    for f in fnd:
+        sev = f["severity"]
+        if _has(f, "top consumer"):
+            share, mem = p["cpu_server_share"], p["mem_pct"]
+            sev = "critical" if share >= a.cpu_critical and srv_busy >= 85 else \
+                "high" if share >= a.cpu_high or mem >= a.mem_high else "warning"
+            f["metrics"] = [("CPU", f"{p['cpu_sustained']:.0f}% of a core ({share:.0f}% of server) [{p['cpu_source']}]"),
+                            ("Memory", f"{fmt_mb(p['mem_mb'])} ({mem:.0f}% of RAM)" if p["mem_mb"] is not None else "n/a (no live data)")]
+        elif _has(f, "disproportionate"):
+            sev = "high" if p["cpu_server_share"] >= a.cpu_threshold * 2 or srv_busy >= 70 else "warning"
+        elif _has(f, "proportional to legitimate"):
+            sev = "info"
+        elif _has(f, "attack activity"):
+            sev = ("critical" if saturated or srv_busy >= 85 else "high") if f["confidence"] == "Likely" else "warning"
+        elif _has(f, "impersonation"):
+            sev = "high"
+        elif _has(f, "worker exhaustion"):
+            sev = "critical" if p.get("fpm_hits", 0) >= 10 or p.get("listen_queue_peak") else "high"
+            f["metrics"] = [("max_children", p.get("max_children") or "?"), ("Limit reached", f"{p.get('fpm_hits', 0)}x"),
+                            ("Listen queue", p.get("listen_queue_peak", 0)), ("Busy peak", p["busy_peak"])]
+        elif _has(f, "queued waiting"):
+            sev = "critical"
+            f["metrics"] = [("Listen queue", p.get("listen_queue_peak", 0)), ("Busy workers", p["busy_peak"])]
+        elif _has(f, "All PHP-FPM workers were busy"):
+            sev = "warning" if short else "high"
+        elif _has(f, "Long-running PHP requests"):
+            sev = "high" if any(x["busy_s"] >= 30 for x in p.get("long_busy", [])) and not short else "warning"
+        elif _has(f, "request_terminate_timeout"):
+            sev = "critical" if p.get("fpm_timeouts", 0) >= 10 else "high"
+        elif _has(f, "Slow PHP execution"):
+            n = fa.get("requests") or 1
+            sev = "high" if (fa.get("p95") or 0) >= 10 or fa.get("over", {}).get(5, 0) >= 0.25 * n else "warning"
+            f["metrics"] = [("p95", fmt_s(fa.get("p95"))), ("Requests >=5s", f"{fa.get('over', {}).get(5, 0):,} of {n:,}")]
+        elif _has(f, "slow-log traces"):
+            sev = "high" if (p.get("slow") or {}).get("entries", 0) >= 50 else "warning"
+        elif _has(f, "High memory per PHP request"):
+            sev = "high" if (fa.get("avg_mem") or 0) >= 256 or fa.get("mem_max", 0) >= 1024 else "warning"
+        elif _has(f, "Recurring slow database"):
+            tm = ((p.get("mysql") or {}).get("slow") or {}).get("time", 0)
+            sev = "critical" if tm >= 1800 else "high" if tm >= 300 else "warning"
+            sq = (p.get("mysql") or {}).get("slow") or {}
+            f["metrics"] = [("Database", p["db"]), ("Slow queries", sq.get("count", 0)), ("Total time", f"{tm:.0f}s")]
+        elif _has(f, "concurrently running queries"):
+            sev = "high"
+        elif _has(f, "Long-running query"):
+            m = re.match(r"(\d+)s, state", f["evidence"][0]) if f["evidence"] else None
+            sev = "info" if "backup" in f["text"] else "high" if m and int(m.group(1)) >= 60 else "warning"
+        elif _has(f, "5xx"):
+            sev = "high" if pct(t.get("errors_5xx", 0), t.get("total") or 1) >= 20 else "warning"
+        elif _has(f, "significant CPU now"):
+            sev = "warning" if short or not any(c["live_cpu"] >= 50 for c in p.get("long_cli", [])) else "high"
+        f["severity"] = sev
+
+
+def calibrate_server_severity(ctx: Ctx, out: list, h: dict):
+    hist = h.get("history") or {}
+    for f in out:
+        sev = f["severity"]
+        if _has(f, "OOM-killer"):
+            sev = "critical"
+        elif _has(f, "Sustained high server CPU"):
+            sev = "critical" if (hist.get("cpu_busy") or (0,))[0] >= 90 else "high"
+        elif _has(f, "High CPU during live sampling"):
+            sev = "warning"
+        elif _has(f, "Memory pressure"):
+            sev = "critical" if h.get("mem_used_pct", 0) >= 95 and any(_has(x, "swap", "OOM") for x in out) else "high"
+        elif _has(f, "Heavy swap"):
+            psi = (h.get("psi", {}).get("memory") or {}).get("some", 0) or 0
+            sev = "high" if psi >= 1 else "warning"
+        elif _has(f, "steal"):
+            sev = "high" if h.get("steal", 0) >= 15 else "warning"
+        elif _has(f, "I/O wait"):
+            sev = "high" if h.get("iowait", 0) >= 25 else "warning"
+        elif _has(f, "nearly full"):
+            m = re.match(r"([\d.]+)% space", f["evidence"][0])
+            sev = "critical" if m and float(m.group(1)) >= 95 else "high"
+        elif _has(f, "Shared service"):
+            m = re.search(r"\(([\d.]+)% of server\).*\(([\d.]+)% of RAM\)", f["evidence"][0])
+            cpu_sh, mem_sh = (float(m.group(1)), float(m.group(2))) if m else (0, 0)
+            sev = "high" if cpu_sh >= 50 or mem_sh >= 60 else "warning" if cpu_sh >= 25 or mem_sh >= 40 else "info"
+        elif _has(f, "max_connections"):
+            sev = "high"
+        elif _has(f, "row locks"):
+            sev = "warning"
+        f["severity"] = sev
 
 
 def fmt_proc(c: dict) -> str:
@@ -2158,6 +2659,7 @@ def fmt_s(v) -> str:
 
 SCENARIO_TEXT = {
     "suspicious": "Suspicious / bot traffic is driving backend load",
+    "bots": "Crawler / bot traffic is driving PHP load",
     "fpm": "PHP-FPM worker saturation is delaying requests",
     "database": "Database query performance is a bottleneck",
     "optimization": "Inefficient application (PHP) execution",
@@ -2171,9 +2673,9 @@ def decide_root_cause(p, fnd, server, suspicious) -> dict:
     for f in fnd:
         if f["scenario"] and f["confidence"] != "Inconclusive":
             by[f["scenario"]].append(f)
-    order = ["suspicious", "fpm", "database", "optimization", "cron", "traffic"]
+    order = ["suspicious", "bots", "fpm", "database", "optimization", "cron", "traffic"]
     primary = [s for s in order if by.get(s)]
-    significant = p["tags"] != ["Normal"] or any(f["severity"] == "critical" for f in fnd)
+    significant = p["tags"] != ["Normal"] or any(f["severity"] in ("critical", "high") for f in fnd)
     if primary and not significant:
         obs = sum(1 for f in fnd if f["severity"] != "info")
         return {"primary": None, "secondary": [], "confidence": "Confirmed", "observations": obs,
@@ -2199,7 +2701,8 @@ def decide_root_cause(p, fnd, server, suspicious) -> dict:
 def two_line_summary(p: dict, window_desc: str) -> list[str]:
     rc = p["root_cause"]
     l1 = (f"{p['app']} ({p['domain'] or p['type']}) used ~{p['cpu_sustained']:.0f}% of one CPU core "
-          f"({p['cpu_server_share']:.0f}% of server capacity) and {fmt_mb(p['mem_mb'])} RAM over {window_desc}, "
+          f"({p['cpu_server_share']:.0f}% of server capacity)" + (f" and {fmt_mb(p['mem_mb'])} RAM" if p["mem_mb"] is not None else "")
+          + f" over {window_desc}, "
           f"serving {p['php_requests']:,} PHP requests"
           + (f" ({p['traffic'].get('total', 0):,} backend requests)" if p.get("traffic", {}).get("total") else "") + ".")
     if rc["primary"] is None:
@@ -2277,6 +2780,8 @@ def server_findings(ctx: Ctx, h: dict, services: dict, oom: dict, mysql: dict, r
         if r.get("Created_tmp_disk_tables", 0) >= 5:
             out.append(F("mysql", "info", "Confirmed", "Frequent on-disk temporary tables",
                          [f"{r['Created_tmp_disk_tables']:.1f}/s during sampling (tmp_table_size={v.get('tmp_table_size', '?')})"]))
+    calibrate_server_severity(ctx, out, h)
+    out.sort(key=lambda f: SEV_ORDER[f["severity"]])
     return out
 
 
@@ -2347,6 +2852,15 @@ def recommendations(ctx: Ctx, profiles: list[dict], srv_findings: list[dict], h:
                   f"The investigation identified a high volume of automated or suspicious requests reaching {p['domain'] or p['app']}, "
                   "which increases server workload. We recommend enabling a web application firewall / bot protection "
                   "(for example Cloudflare with rate limiting) and restricting abusive sources.")
+        if "bots" in [rc["primary"]] + rc["secondary"]:
+            bnames = [b["name"] for b in (p.get("traffic") or {}).get("bots", []) if b.get("level") == "HIGH"]
+            internal.append({"app": p["app"], "text": "Crawler traffic is driving PHP load: rate-limit/block aggressive SEO/AI bots "
+                             f"({', '.join(bnames[:3]) or 'see bot table'}); keep verified search engines, tune their crawl rate",
+                             "evidence": ev_of("bots")[:4]})
+            add_c("bots", "Bot / Crawler Traffic Management",
+                  "A significant share of the application's server workload comes from automated crawlers (for example SEO and "
+                  "AI bots) rather than visitors. We recommend limiting non-essential crawlers through bot management or rate-limiting "
+                  "rules (for example Cloudflare bot rules) and robots.txt, while keeping legitimate search engines allowed.")
         if "fpm" in [rc["primary"]] + rc["secondary"]:
             internal.append({"app": p["app"], "text": f"Investigate PHP-FPM worker saturation (pm.max_children={p.get('max_children', '?')}); "
                              "fix slow execution first, raise max_children only if RAM allows "
@@ -2413,10 +2927,11 @@ def recommendations(ctx: Ctx, profiles: list[dict], srv_findings: list[dict], h:
 # ----------------------------------------------------------------------------
 # Rendering (plain text / ANSI terminal / Markdown) - no third-party deps
 # ----------------------------------------------------------------------------
-ANSI = {"red": "\033[1;31m", "yellow": "\033[1;33m", "green": "\033[1;32m", "blue": "\033[1;34m",
+ANSI = {"red": "\033[1;31m", "orange": "\033[1;38;5;208m", "yellow": "\033[1;33m", "green": "\033[1;32m", "blue": "\033[1;34m",
         "cyan": "\033[1;36m", "bold": "\033[1m", "dim": "\033[2m", "reset": "\033[0m"}
-SEV_COLOR = {"critical": "red", "warning": "yellow", "info": "blue", "ok": "green"}
-SEV_TAG = {"critical": "[CRITICAL]", "warning": "[WARNING]", "info": "[INFO]", "ok": "[OK]"}
+SEV_COLOR = {"critical": "red", "high": "orange", "warning": "yellow", "info": "blue", "ok": "green"}
+SEV_TAG = {"critical": "[CRITICAL]", "high": "[HIGH]", "warning": "[WARNING]", "info": "[INFO]", "ok": "[HEALTHY]"}
+SEV_NAME = {"critical": "CRITICAL", "high": "HIGH", "warning": "WARNING", "info": "INFO", "ok": "HEALTHY"}
 W = 78
 
 
@@ -2432,6 +2947,7 @@ class Doc:
     def bullet(self, t, sev=None, level=0): self.blocks.append(("bullet", t, sev, level))
     def table(self, headers, rows, align=None, maxw=None): self.blocks.append(("table", headers, rows, align, maxw))
     def blank(self): self.blocks.append(("blank",))
+    def banner(self, t, sev=None): self.blocks.append(("banner", t, sev))
 
     # -- renderers
     def render(self, fmt: str, color: bool) -> str:
@@ -2455,7 +2971,11 @@ class Doc:
                 for r in b[1]:
                     val = str(r[1])
                     sev = r[2] if len(r) > 2 else None
-                    out.append(f"  {r[0]:<{wk}} : " + self._c(val, SEV_COLOR.get(sev), color and sev is not None))
+                    room = max(30, W - wk - 5)
+                    parts = wrap(val, room) if len(val) > room else [val]
+                    for i, part in enumerate(parts):
+                        lead = f"  {r[0]:<{wk}} : " if i == 0 else " " * (wk + 5)
+                        out.append(lead + self._c(part.strip() if i else part, SEV_COLOR.get(sev), color and sev is not None))
             elif k == "text":
                 for ln in wrap(b[1], W - 2):
                     out.append("  " + self._c(ln, SEV_COLOR.get(b[2]), color and b[2] is not None))
@@ -2472,6 +2992,11 @@ class Doc:
                 out += render_table(b[1], b[2], b[3], b[4], color)
             elif k == "blank":
                 out.append("")
+            elif k == "banner":
+                col = SEV_COLOR.get(b[2]) if b[2] else "cyan"
+                out.append(self._c("=" * W, col, color))
+                if b[1]:
+                    out += [self._c(b[1].center(W), col, color), self._c("=" * W, col, color)]
         return "\n".join(out) + "\n"
 
     def _md(self) -> str:
@@ -2500,6 +3025,8 @@ class Doc:
                 out.append("")
             elif k == "blank":
                 out.append("")
+            elif k == "banner" and b[1]:
+                out += ["", f"## {b[1]}", ""]
         return "\n".join(out) + "\n"
 
 
@@ -2537,6 +3064,94 @@ def render_table(headers, rows, align=None, maxw=None, color=False) -> list[str]
     return [sep, head, sep] + [line(r) for r in rows] + [sep] if rows else ["  (no data)"]
 
 
+def collect_alerts(R: dict, min_sev: str = "warning") -> list[dict]:
+    """All findings at or above min_sev, de-duplicated, most severe first."""
+    limit = SEV_ORDER[min_sev]
+    out, seen = [], set()
+    for p in R["top"]:
+        for f in p["findings"]:
+            if SEV_ORDER[f["severity"]] <= limit:
+                out.append({**f, "app": p["app"], "domain": p.get("domain", "")})
+    for f in R["server_findings"]:
+        if SEV_ORDER[f["severity"]] <= limit:
+            out.append({**f, "app": "(server)", "domain": ""})
+    res = []
+    for a in sorted(out, key=lambda x: (SEV_ORDER[x["severity"]], CONF_ORDER.get(x["confidence"], 9))):
+        k = (a["app"], a["text"])
+        if k not in seen:
+            seen.add(k)
+            res.append(a)
+    return res
+
+
+def short_action(a: str) -> str:
+    a = a.split(";")[0].split(". ")[0].strip().rstrip(".")
+    return trunc(a, 64)
+
+
+def render_alerts(d: "Doc", R: dict):
+    alerts = collect_alerts(R)
+    d.banner("HIGH PRIORITY FINDINGS", "critical" if any(a["severity"] == "critical" for a in alerts) else
+             "high" if any(a["severity"] == "high" for a in alerts) else "ok")
+    if not alerts:
+        d.text("[HEALTHY] No CRITICAL, HIGH or WARNING findings - no significant resource or performance issue detected.", "ok")
+    shown = [a for a in alerts if a["severity"] in ("critical", "high")] + \
+        [a for a in alerts if a["severity"] == "warning"][:6]
+    for a in shown:
+        d.blank()
+        d.text(f"{SEV_TAG[a['severity']]} {a['text'].upper()}", a["severity"])
+        rows = [("Application", a["app"] + (f" ({a['domain']})" if a["domain"] else ""))]
+        rows += [(k, v) for k, v in a.get("metrics", [])]
+        rows.append(("Confidence", a["confidence"]))
+        rows.append(("Evidence", "; ".join(a["evidence"][:2]) or "-"))
+        if a.get("action"):
+            rows.append(("Next action", a["action"]))
+        d.kv(rows)
+    hidden = len(alerts) - len(shown)
+    if hidden > 0:
+        d.text(f"(+{hidden} more WARNING findings in section 7 and the final summary)")
+    d.banner("", None)
+
+
+LEVEL_SEV = {"HIGH": "high", "WARNING": "warning", "NORMAL": "ok"}
+
+
+def render_bots(d: "Doc", p: dict):
+    t = p.get("traffic") or {}
+    bots = t.get("bots") or []
+    d.h3(f"{p['app']} - Bot & crawler analysis")
+    if not bots:
+        d.text("No identifiable bot/crawler/automated traffic in the window.")
+        return
+    total = t["total"] or 1
+    cat = dict(t.get("bot_by_category", []))
+    d.kv([("Automated traffic", f"{t['bot_requests']:,} of {t['total']:,} backend requests ({pct(t['bot_requests'], total):.0f}%), "
+                                f"{t['bot_dynamic']:,} dynamic"),
+          ("By category", ", ".join(f"{BOT_CATEGORY_LABEL.get(k, k)} {v:,}" for k, v in cat.items())),
+          ("Est. bot share of PHP CPU", f"{t.get('bot_php_cpu_share', 0):.0f}% (attributed by client IP via php-app.access.log; estimated)")])
+    if any(b.get("level") == "HIGH" for b in bots):
+        d.text("HIGH BOT TRAFFIC DETECTED", "high")
+    d.table(["Bot", "Category", "Requests", "Share", "/min", "IPs", "Dyn%", "PHP CPU", "Status"],
+            [[b["name"], b.get("category_label", b["category"]), f"{b['requests']:,}", f"{b['pct']:.0f}%", f"{b['rpm']:.1f}",
+              b["unique_ips"], f"{pct(b['dynamic'], b['requests']):.0f}%", f"{b.get('php_cpu_share', 0):.0f}%", b.get("level", "-")]
+             for b in bots[:12]],
+            align=["l", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[26, 30, 0, 0, 0, 0, 0, 0, 0])
+    for b in [b for b in bots if b.get("level") in ("HIGH", "WARNING") or b.get("impersonation")][:4]:
+        d.bullet(f"{b['name']} ({b['level']}): {b['requests']:,} requests, peak {b['peak_rpm']}/min, "
+                 f"{b['dynamic']:,} dynamic / {b['static']:,} static"
+                 + (f", frontend (nginx) {b['frontend']:,}" if b.get("frontend") else "")
+                 + f", est. {b.get('php_requests_est', 0):,} PHP requests / {b.get('php_cpu_s_est', 0)}s PHP CPU",
+                 LEVEL_SEV.get(b["level"], "warning"))
+        d.bullet("Top IPs: " + ", ".join(f"{ip} ({n:,})" for ip, n in b["top_ips"]), None, 1)
+        d.bullet("Top URLs: " + ", ".join(f"{u} ({n:,})" for u, n in b["top_urls"][:4]), None, 1)
+        d.bullet("Status: " + ", ".join(f"{k}:{v:,}" for k, v in b["status"]), None, 1)
+        if b.get("verification"):
+            v = b["verification"]
+            d.bullet(f"DNS verification: {v['status']} ({v['verified']} verified, {v['failed']} failed of {len(v['checked'])} IPs checked)",
+                     "high" if b.get("impersonation") else None, 1)
+    d.text("Bots cannot be attributed MySQL activity directly (no per-request DB data); see section 6 for database load.")
+
+
 def map_label(app: str, src: str | None) -> str:
     if not app:
         return "unmapped"
@@ -2562,6 +3177,8 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
           ("History source", f"atop ({hist.get('intervals', 0)} x {hist.get('interval_s', 0)}s intervals)" if hist else "none (live + logs only)"),
           ("Tool version", VERSION)])
     d.text("CPU values are '% of one vCPU core' unless marked 'of server'. 'Estimated' marks derived values; everything else is measured.")
+    d.text("Severity: CRITICAL (red) > HIGH (orange) > WARNING (yellow) > INFO (blue) > HEALTHY (green).")
+    render_alerts(d, R)
     # 2. Server health
     d.h2("2. Overall Server Health")
     load = h.get("load", (0, 0, 0))
@@ -2658,6 +3275,7 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
             d.bullet(s["text"], "warning")
         if not p.get("traffic_signals"):
             d.bullet("No suspicious-traffic indicators triggered.", "ok")
+        render_bots(d, p)
     return build_report_part2(ctx, R, d)
 
 
@@ -2800,6 +3418,14 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
         d.bullet(n, "info")
     # 12. Final
     d.h2("12. Final Investigation Summary")
+    alerts = collect_alerts(R, "info")
+    rank = [a for a in alerts if a["severity"] != "info"] or alerts[:5]
+    if rank:
+        d.table(["Finding", "Application", "Severity", "Recommended action"],
+                [[trunc(a["text"], 46), a["app"], SEV_NAME[a["severity"]], short_action(a.get("action") or "-")] for a in rank[:25]],
+                align=["l", "l", "l", "l"], maxw=[46, 12, 0, 64])
+    else:
+        d.text("[HEALTHY] No findings that need action.", "ok")
     for i, p in enumerate(top, 1):
         d.text(f"{i}. {p['app']}: {p['root_cause']['text']} [{p['root_cause']['confidence']}]")
         d.text("   " + p["summary"][0])
@@ -2858,6 +3484,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--atop-timeout", type=float, default=90)
     ap.add_argument("--cpu-threshold", type=float, default=20, help="High CPU = this %% of server capacity (default 20)")
     ap.add_argument("--mem-threshold", type=float, default=15, help="High memory = this %% of RAM (default 15)")
+    ap.add_argument("--cpu-high", type=float, default=40, help="App CPU share of server for HIGH (default 40)")
+    ap.add_argument("--cpu-critical", type=float, default=70, help="App CPU share for CRITICAL when server is saturated (default 70)")
+    ap.add_argument("--mem-high", type=float, default=30, help="App memory %% of RAM for HIGH (default 30)")
+    ap.add_argument("--php-rpm-per-core-warn", type=float, default=120,
+                    help="PHP requests/min per vCPU considered high volume (default 120)")
     ap.add_argument("--cpu-ms-per-req-threshold", type=float, default=400, help="Inefficient PHP above this CPU ms/request (default 400)")
     ap.add_argument("--slow-p95-seconds", type=float, default=3, help="Slow PHP when p95 duration >= this (default 3s)")
     ap.add_argument("--slow-query-min", type=int, default=10, help="Min slow queries per DB to flag (default 10)")
@@ -2866,6 +3497,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--long-request-seconds", type=float, default=10,
                     help="Live: FPM worker busy continuously this long = long-running request (default 10)")
     ap.add_argument("--bg-cpu-threshold", type=float, default=10, help="Background process CPU %% of one core to flag (default 10)")
+    ap.add_argument("--no-dns-verify", action="store_true",
+                    help="Do not verify claimed search-engine bots via reverse/forward DNS")
+    ap.add_argument("--dns-verify-max", type=int, default=60, help="Max IPs to DNS-verify per run (default 60)")
+    ap.add_argument("--bot-share-high", type=float, default=25, help="Bot share of backend requests flagged HIGH (default 25%%)")
+    ap.add_argument("--bot-share-warn", type=float, default=10, help="Bot share flagged WARNING (default 10%%)")
     ap.add_argument("--chrome-latest-major", type=int, default=0)
     ap.add_argument("--chrome-obsolete-margin", type=int, default=40)
     ap.add_argument("--no-ip-lookup", action="store_true", help=argparse.SUPPRESS)   # compat: this tool never sends IPs out
@@ -2901,6 +3537,7 @@ def investigate(args) -> tuple[Ctx, dict]:
         start, end = now - timedelta(hours=hours), now
         window_desc = f"last {hours:g} hour(s) ({start:%Y-%m-%d %H:%M} -> {end:%H:%M} UTC)"
     window_s = (end - start).total_seconds()
+    args.window_s = window_s
     short_window = f"the last {window_s / 3600:g}h" if not (args.from_time or args.to_time) else window_desc
     if args.minutes:
         args.sample_seconds = args.minutes * 60
@@ -2958,12 +3595,14 @@ def investigate(args) -> tuple[Ctx, dict]:
     for pool in ctx.pools.values():
         pools_by_app[pool["app"]].append(pool)
     listen = sample["server"]["listen"]
+    verifier = BotVerifier(ctx)
     for p in top:
         ap = apps[p["app"]]
         ctx.progress(f"[{p['app']}] deep analysis: FPM access log, traffic, slow log")
         p["fpm"] = analyze_fpm_access(ctx, ap, start, end, deep=True)
         p["traffic"] = analyze_traffic(ctx, ap, start, end)
         p["slow"] = analyze_slowlog(ctx, ap, start, end)
+        correlate_bots(ctx, verifier, p)
         p["cron"] = analyze_cron_log(ap, start)
         cands = sorted(pools_by_app.get(p["app"], []), key=lambda x: x.get("php_version", ""))
         active = [c for c in cands if ("fpm:" + c["pool"]) in p["proc_kinds"]] or cands[-1:]
