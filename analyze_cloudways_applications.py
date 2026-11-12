@@ -2300,19 +2300,18 @@ def bot_level(ctx: Ctx, b: dict, t: dict) -> str:
     if b["requests"] < 200:
         return "NORMAL"
     share, cpu = b["pct"], b.get("php_cpu_share", 0.0)
-    # Absolute load: a large *share* of a nearly idle app is irrelevant.
+    # Absolute load: a large *share* of a nearly idle app is irrelevant. HIGH needs real PHP cost.
     core_pct = b.get("php_cpu_s_est", 0.0) / max(getattr(a, "window_s", 3600), 1) * 100.0
-    busy_rate = b["rpm"] >= a.bot_min_rpm
+    b["php_core_pct"] = round(core_pct, 1)
+    heavy, notable = core_pct >= a.bot_high_cpu, core_pct >= a.bot_min_cpu or b["rpm"] >= 60
     if b["category"] == "monitor" or b["name"].startswith("WordPress loopback"):
-        return "WARNING" if b["rpm"] >= 30 or core_pct >= 10 else "NORMAL"
-    if not busy_rate and core_pct < 3:
-        return "NORMAL"
+        return "WARNING" if heavy or b["rpm"] >= 60 else "NORMAL"
     if b.get("category_label") == "Search engine (verified)":
-        return "HIGH" if cpu >= 40 and core_pct >= 10 else "WARNING" if (share >= 40 or cpu >= 20) else "NORMAL"
+        return "HIGH" if cpu >= 40 and heavy else "WARNING" if (share >= 40 or cpu >= 20) and notable else "NORMAL"
     mostly_static = pct(b["dynamic"], b["requests"]) < 20 and cpu < 10
-    if (share >= a.bot_share_high or cpu >= 25) and (core_pct >= 3 or busy_rate):
+    if (share >= a.bot_share_high or cpu >= 25) and heavy:
         return "WARNING" if mostly_static and not b.get("impersonation") else "HIGH"
-    if share >= a.bot_share_warn or cpu >= 10 or b.get("impersonation"):
+    if (share >= a.bot_share_warn or cpu >= 10) and notable or (b.get("impersonation") and notable):
         return "WARNING"
     return "NORMAL"
 
@@ -2485,7 +2484,8 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
         for b in flagged[:4]:
             dyn = pct(b["dynamic"], b["requests"])
             ev.append(f"{b['name']} [{b.get('category_label', b['category'])}]: {b['requests']:,} req ({b['pct']:.0f}% of backend), "
-                      f"{b['rpm']:.0f}/min, {b['unique_ips']} IPs, {dyn:.0f}% dynamic, est. {b['php_cpu_share']:.0f}% of app PHP CPU"
+                      f"{b['rpm']:.0f}/min, {b['unique_ips']} IPs, {dyn:.0f}% dynamic, est. {b['php_cpu_share']:.0f}% of app PHP CPU "
+                      f"(~{b.get('php_core_pct', 0):.0f}% of a core)"
                       + (" - mostly static/cached, not driving PHP" if dyn < 20 else ""))
         drives = hi_cpu and cpu_bots >= 30
         static_only = cpu_bots < 10 and all(pct(b["dynamic"], b["requests"]) < 20 for b in flagged)
@@ -3507,8 +3507,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dns-verify-max", type=int, default=60, help="Max IPs to DNS-verify per run (default 60)")
     ap.add_argument("--bot-share-high", type=float, default=25, help="Bot share of backend requests flagged HIGH (default 25%%)")
     ap.add_argument("--bot-share-warn", type=float, default=10, help="Bot share flagged WARNING (default 10%%)")
-    ap.add_argument("--bot-min-rpm", type=float, default=5,
-                    help="Bots below this req/min and <3%% of a core PHP CPU are never flagged (default 5)")
+    ap.add_argument("--bot-high-cpu", type=float, default=5,
+                    help="Bot PHP CPU (%% of one core, window average) required for HIGH (default 5)")
+    ap.add_argument("--bot-min-cpu", type=float, default=2,
+                    help="Bots under this PHP CPU (%% of a core) and under 60 req/min are never flagged (default 2)")
     ap.add_argument("--chrome-latest-major", type=int, default=0)
     ap.add_argument("--chrome-obsolete-margin", type=int, default=40)
     ap.add_argument("--no-ip-lookup", action="store_true", help=argparse.SUPPRESS)   # compat: this tool never sends IPs out

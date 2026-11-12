@@ -85,4 +85,7 @@ low = {"name": "UptimeRobot", "category": "monitor", "requests": 284, "pct": 59,
 assert cw.bot_level(c2, low, {}) == "NORMAL", cw.bot_level(c2, low, {})
 seo = {"name": "AhrefsBot", "category": "seo", "requests": 30000, "pct": 35, "rpm": 21, "dynamic": 29000, "php_cpu_share": 60, "php_cpu_s_est": 20000.0}
 assert cw.bot_level(c2, seo, {}) == "HIGH"
+agent = {"name": "Node.js HTTP client", "category": "automation", "requests": 37583, "pct": 100, "rpm": 26, "dynamic": 37583,
+         "php_cpu_share": 100, "php_cpu_s_est": 900.0}       # ~1% of a core over 24h: not a problem
+assert cw.bot_level(c2, agent, {}) == "NORMAL", cw.bot_level(c2, agent, {})
 print("bot-level ok")
