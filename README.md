@@ -33,12 +33,12 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 ## What the report contains
 
 1. Investigation Overview
-2. Overall Server Health: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, and the CPU/RAM split between apps and shared services
+2. Overall Server Health: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, the CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
 3. Top N resource-consuming applications, with profile tags: High CPU, High Memory, Many FPM workers, Low traffic / high cost
 4. Application Traffic Analysis: requests, req/min and req/s, unique IPs, top IPs/URLs/User-Agents, status codes, static vs dynamic, WordPress REST/admin-ajax/wp-login/xmlrpc/wp-cron, WooCommerce, bots, attack indicators
 5. PHP-FPM Investigation: pool config, live and peak workers, listen queue, max_children hits, timeouts, duration percentiles, CPU ms/request, memory per request, slowest paths and slow-log functions
 6. MySQL / MariaDB Investigation: connections, query rates, lock waits, deadlocks, slow-query fingerprints per database/app, running queries per database
-7. Application-Level Bottlenecks: findings, each with numeric evidence and a confidence level
+7. Application-Level Bottlenecks: findings, each with numeric evidence, severity, a confidence level and a recommended next action
 8. Root Cause Analysis: root cause, confidence (Confirmed / Likely / Suspected / Inconclusive) and a two-line summary
 9. Internal PlatformOps Recommendations, each with the evidence that triggered it
 10. Customer-Shareable Recommendations, in a copy-paste block
@@ -58,6 +58,9 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 | `--no-color`, `--progress`, `--verbose` | output control |
 | `--skip-health`, `--skip-mysql`, `--skip-history` | skip optional collectors |
 | `--explain` | opt-in read-only `EXPLAIN` for suspected full-scan SELECTs |
+| `--long-request-seconds N` | live: an FPM worker busy continuously this long counts as a long-running request (default 10) |
+| `--pool-conf-glob G` | comma-separated globs for PHP-FPM pool configs (default `/etc/php/*/fpm/pool.d/*.conf,/etc/php-fpm.d/*.conf`) |
+| `--help`, `--version` | usage and version |
 
 `--skip-health` is kept from the traffic analyzer for compatibility. Here it skips Redis/Varnish/OOM/filesystem checks; the WP health manager is never run. `--no-ip-lookup` is accepted and ignored, because this tool never sends visitor IPs to a third party.
 
@@ -92,21 +95,115 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 - **Upscaling** is recommended only when the load is traffic-driven **and** server pressure is sustained (atop average ≥75% busy or ≥50% of intervals ≥85%, memory ≥90%, heavy swap, or OOM kills). A momentary spike never triggers it.
 - No evidence leads to "No sustained bottleneck" (when nothing is elevated) or **Inconclusive**.
 
-## Safety
+## Safety (read-only by design)
 
-No package installs. No writes, except the optional report/JSON files. No restarts, kills or configuration changes. Every subprocess runs without a shell and with a timeout. SQL literals are masked, credentials are never read into output, and command lines shown for CLI processes have password arguments masked. Visitor IPs are not sent to external services.
+The script only reads. It never:
 
-## Validation status
+- installs anything (no pip/apt/yum, and no auto-install of optional libraries)
+- changes PHP-FPM, MySQL, web server or system configuration
+- restarts, reloads, enables or disables services
+- kills processes
+- changes files, permissions, logs, cron jobs, firewall rules or databases
 
-- Parsers were tested against real log lines from a Debian 12 / MariaDB 11.4 / multi-PHP Cloudways server: FPM access format, backend access, atop `-P` output, FPM pool includes, MariaDB slow log and PHP slow log.
-- An end-to-end run against synthetic app fixtures covered the slow-plugin, normal-traffic and wp-login brute-force cases. Unit tests covered the traffic-driven + upscale case and the DB-slow-causing-FPM-saturation case.
-- **Live run** as root on a 1-vCPU Debian 12 Cloudways server with 10 apps and multi-PHP: about 28 s in total, with atop history (31 intervals), PSS, pool configs, listen queues, the MariaDB processlist and STATUS deltas all working. The first run's false positives were fixed: hidden directories counted as apps, the platform FPM pool counted as an app, lifetime CPU of PM2/node daemons flagged as current load, and a subnet signal that double-counted a single IP. The second run correctly reports "No sustained bottleneck" for every idle app.
-- **Not yet seen live:** a server under real CPU/memory pressure, max_children breaches, or a busy MySQL slow log. Validate on a loaded server before relying on it fully.
+MySQL is queried only with `SHOW` / `SELECT` against `information_schema`, plus `EXPLAIN` if you pass `--explain`. Every subprocess runs without a shell and with a timeout. Large logs are streamed (and binary-searched to the window start), never loaded into memory.
+
+SQL literals are masked, credentials are never printed, and password-like arguments in process command lines are masked. Visitor IPs are never sent to an external service. The only files it writes are the optional `--report`/`--json` outputs, to `--output-dir` (default `/tmp`, mode 600), and their paths are printed at the end.
+
+## Architecture
+
+```
+discover apps + PHP-FPM pools ──► per-app CPU-seconds from php-app.access.log (all apps, window)
+        │                                    │
+        ▼                                    ▼
+live /proc sampling (N samples) ──► atop history (window) ──► rank apps (CPU share + memory share)
+  + MySQL processlist each sample                                  │ top N
+        │                                                          ▼
+        └──────────► deep per-app analysis: traffic, FPM access/slow/master logs,
+                     pool limits, listen queue, MySQL slow-log + live per-DB
+                                          │
+                                          ▼
+         correlation engine: findings (evidence, severity, confidence, next action)
+            → root cause per app → issue origin (apps / services / other / infra)
+            → internal + customer recommendations → txt / ANSI / Markdown / JSON
+```
+
+**Mapping app → processes:** PHP-FPM workers are matched by `php-fpm: pool <name>` and the parsed pool config. Everything else (WP-CLI, cron, node/PM2) is matched by the app's system user, which equals the pool `user`. Unresolvable pools (platform pools) are reported as shared services.
+
+**Mapping database → app:** `DB_NAME` from wp-config.php, Magento env.php or Laravel `.env` (labelled *config*). Failing that, the Cloudways convention that the database name equals the app ID (labelled *naming*). Anything else is shown as *unmapped*.
+
+## Example output
+
+This excerpt is from the synthetic test fixture (`tests/mkfix.py`), run on macOS, so the live `/proc` columns show `n/a`. On a Linux server they are filled in.
+
+```
+3. TOP 3 RESOURCE-CONSUMING APPLICATIONS
+  | # | Application | CPU live | CPU live pk | CPU window | CPU win pk | Srv% | Mem live | Mem window |
+  | 1 | slowblog    |      n/a |         n/a |        50% |        n/a |   5% |      n/a |        n/a |
+  ...
+7. APPLICATION-LEVEL BOTTLENECKS (KEY FINDINGS)
+▸ slowblog
+  - [WARNING] Slow PHP execution (measured in PHP-FPM access log) [Confirmed]
+      - p95 11.53s, p99 11.89s, max 12.0s over 328 requests
+      - Top CPU path: / - 132 hits, 716.5s CPU, avg 7.038s
+      - Next action: Profile the slowest paths listed; check slow-log traces
+          and slow queries for the same window.
+  - [WARNING] 1 slow-log traces (> request_slowlog_timeout ?) [Confirmed]
+      - Components: plugin:heavy-sync (1)
+      - curl_exec() at wp-content/plugins/heavy-sync/api.php:88 - 1 traces
+8. ROOT CAUSE ANALYSIS
+▸ slowblog
+  Root cause   : Inefficient application (PHP) execution
+  Confidence   : Likely
+  slowblog (wordpress) used ~50% of one CPU core (5% of server capacity) ...
+  Most likely reason [Likely]: inefficient application (PHP) execution.
+10. CUSTOMER-SHAREABLE RECOMMENDATIONS
+  >>> BEGIN CUSTOMER RESPONSE >>>
+  Application Optimization Required (slowblog)
+  The investigation identified resource-intensive PHP execution associated
+    with the application. We recommend reviewing the application code,
+    plugins, themes and scheduled tasks to improve execution efficiency.
+  Unwanted / Bot Traffic Mitigation (botsite)
+  ...
+  <<< END CUSTOMER RESPONSE <<<
+```
+
+## Known limitations
+
+- **No PHP-FPM status page on Cloudways.** "Busy" and "idle" workers are estimated from process state and CPU activity. Live long-running requests are inferred from a worker staying busy continuously; the script path comes from the slow log, not from the worker.
+- **Live sampling misses very short-lived workers** (`pm.process_idle_timeout=1s`). Window CPU therefore prefers atop history and FPM access-log CPU-seconds.
+- **FPM access-log CPU% covers PHP-FPM requests only.** CLI and cron CPU comes from atop and live sampling.
+- **Per-database query counts aren't available** while `performance_schema` is OFF, which is the Cloudways default. Database activity per app is limited to processlist samples (connections and running queries) and the slow log.
+- **The slow log only contains queries over `long_query_time`** (5 s on Cloudways), so moderately slow, high-frequency queries are not visible.
+- **Missing-index claims stay *Suspected*** unless `--explain` is used.
+- **The listen queue is only measured live,** through `ss`. Historical saturation comes from the "max_children reached" warnings in the FPM master log.
+- **Peak concurrency in the window is an estimate,** derived from busy worker-seconds per second.
+- **As non-root,** MySQL, atop, PSS, pool overrides and some logs are unavailable. The report lists each one.
+- **Traffic analysis needs the Cloudways log layout** (`<app>/logs/backend_*.access.log` or the nginx access/status logs).
+
+## Testing results
+
+What was actually run (2026-11-12):
+
+| Test | Environment | Result |
+|---|---|---|
+| Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
+| RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
+| `tests/test_matrix.py` (17 checks) | macOS, synthetic | **17/17 pass** |
+| ↳ 121 apps, run time | | 4.6 s |
+| ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
+| ↳ low-traffic / high-CPU app ranked #1, root cause = optimization | | pass |
+| ↳ xmlrpc flood → suspicious; busy legitimate app → not suspicious | | pass |
+| ↳ nginx-only app (no backend log), app with no logs, unreadable log, hidden dir | | pass, no crash |
+| ↳ credentials never printed; Markdown file has no ANSI codes; every finding has a next action | | pass |
+| Live, root | 1-vCPU Debian 12 Cloudways server, 10 apps, PHP 8.3/8.4, MariaDB 11.4, atop | pass, 26–28 s; all collectors working |
+| Live, non-root | same server, unprivileged user | pass; MySQL/atop/PSS/FPM logs reported as unavailable, no crash |
+
+**Not yet tested on a real server:** sustained high CPU or memory pressure, real max_children breaches, OOM kills, a busy MySQL slow log, a Lightning (nginx-only) stack, or a server with 50–100+ real apps. The logic for these was tested only with synthetic data. Run it on such a server and compare its conclusions with a manual investigation before relying on it fully.
 
 ## Development
 
 ```bash
-tests/run_tests.sh      # offline: parsers, RCA scenarios, end-to-end report on synthetic app logs
+tests/run_tests.sh      # offline: parsers, RCA scenarios, end-to-end report, 17-check scenario matrix
 ```
 
 `tests/mkfix.py` generates a synthetic Cloudways applications root with three cases: a slow-plugin app, a normal busy shop, and a wp-login brute-force target. To test changes on a real server without copying files, push a branch and run:
@@ -129,7 +226,7 @@ curl -sS https://raw.githubusercontent.com/jahanzaibakhan/cloudways-app-investig
 | Correlation engine | `investigate_app()`, `decide_root_cause()`, `server_findings()`, `recommendations()` |
 | Rendering | `Doc` model, then txt/ANSI or Markdown |
 
-All thresholds are CLI flags (`--cpu-threshold`, `--mem-threshold`, `--cpu-ms-per-req-threshold`, `--slow-p95-seconds`, `--slow-query-min`, `--long-query-seconds`, `--steal-threshold`, `--bg-cpu-threshold`).
+All thresholds are CLI flags (`--cpu-threshold`, `--mem-threshold`, `--cpu-ms-per-req-threshold`, `--slow-p95-seconds`, `--slow-query-min`, `--long-query-seconds`, `--steal-threshold`, `--bg-cpu-threshold`, `--long-request-seconds`).
 
 ## Origin
 

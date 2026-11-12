@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -524,14 +524,17 @@ def collect_pools(ctx: Ctx, apps: dict) -> dict[str, dict]:
         m = re.search(r"/php/([\d.]+)/", conf)
         for name in set(pools) - before:
             pools[name]["php_version"] = m.group(1) if m else ""
-    user_to_app = {}
+    user_to_app, unreadable = {}, []
     for name, p in pools.items():
         app = resolve_pool_app(name, p, apps)
         p["app"] = app
         if p.get("user") and app in apps:
             user_to_app[p["user"]] = app
         if p.get("_unreadable"):
-            ctx.note(f"Some pool include files are unreadable (run as root for full PHP-FPM config): {p['_unreadable'][0]}")
+            unreadable.append(p["_unreadable"][0])
+    if unreadable:
+        ctx.note(f"{len(unreadable)} pool include file(s) unreadable, e.g. {unreadable[0]} - app-level PHP-FPM "
+                 "overrides (max_children etc.) may be missing; run as root.")
     ctx.user_to_app = user_to_app
     return pools
 
@@ -691,7 +694,7 @@ def classify_process(comm: str, cmd: str, uid: int, ctx: Ctx, apps: dict) -> tup
     user = uid_name(uid)
     app = ctx.user_to_app.get(user) or (user if user in apps else None)
     if app:
-        kind = "cron/cli"
+        kind = f"cli:{comm}"
         if "wp-cron" in cmd or " cron " in cmd:
             kind = "wp-cron"
         elif "wp " in cmd or "wp-cli" in cmd:
@@ -1872,7 +1875,7 @@ def build_profiles(ctx: Ctx, apps: dict, sample: dict, history: dict | None, fpm
             "cpu_hist_peak_at": hv["cpu_peak_at"] if hv else "",
             "cpu_fpm_pct": fpm_cpu_pct if fq.get("requests") else None,
             "cpu_server_share": sustained / NCPU,
-            "mem_mb": mem_basis, "mem_kind": "PSS" if lv.get("pss_mb") is not None else "RSS",
+            "mem_mb": mem_now if lv else None, "mem_kind": "PSS" if lv.get("pss_mb") is not None else "RSS",
             "mem_peak_mb": lv.get("rss_peak_mb"), "mem_hist_avg": mem_hist, "mem_hist_peak": hv["rss_peak_mb"] if hv else None,
             "mem_pct": pct(mem_basis, mem_total_mb),
             "procs_peak": lv.get("procs_peak", 0), "busy_peak": lv.get("busy_peak", 0), "busy_avg": lv.get("busy_avg", 0),
@@ -1993,7 +1996,8 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
         ev.append(f"Live sampling: avg {p['cpu_live_avg']:.0f}% / peak {p['cpu_live_peak']:.0f}% of one core over {a.sample_seconds:.0f}s")
     if p.get("cpu_hist_peak") is not None:
         ev.append(f"atop history: peak {p['cpu_hist_peak']:.0f}% of one core at {p['cpu_hist_peak_at']}")
-    ev.append(f"Memory {fmt_mb(p['mem_mb'])} {p['mem_kind']} ({p['mem_pct']:.1f}% of RAM)")
+    if p["mem_mb"] is not None:
+        ev.append(f"Memory {fmt_mb(p['mem_mb'])} {p['mem_kind']} ({p['mem_pct']:.1f}% of RAM)")
     if hi_cpu or hi_mem:
         fnd.append(F("resources", "warning", "Confirmed",
                      f"Application is a top consumer: {', '.join(x for x in p['tags'] if x != 'Normal')}", ev))
@@ -2134,9 +2138,16 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
     return p
 
 
+def fmt_age(sec: int) -> str:
+    if sec >= 86400:
+        return f"{sec / 86400:.1f}d"
+    if sec >= 3600:
+        return f"{sec / 3600:.1f}h"
+    return f"{sec // 60}m"
+
+
 def fmt_proc(c: dict) -> str:
-    days = c["age_s"] / 86400
-    age = f"{days:.1f}d" if days >= 1 else f"{c['age_s'] // 60}m"
+    age = fmt_age(c["age_s"])
     return (f"PID {c['pid']} {c.get('comm', '')}: {c['live_cpu']:.0f}% CPU now, {c['life_cpu']:.0f}% lifetime avg, "
             f"running {age}: {trunc(c['cmd'], 70)}")
 
@@ -2602,7 +2613,7 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
             [[i, p["app"], pc(p.get("cpu_live_avg")), pc(p.get("cpu_live_peak")),
               pc(p["cpu_hist_avg"] if p.get("cpu_hist_avg") is not None else p.get("cpu_fpm_pct")),
               pc(p.get("cpu_hist_peak")), f"{p['cpu_server_share']:.0f}%",
-              f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}", fmt_mb(p.get("mem_hist_avg")) + (" RSS" if p.get("mem_hist_avg") else "")]
+              (f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}" if p['mem_mb'] is not None else "n/a"), fmt_mb(p.get("mem_hist_avg")) + (" RSS" if p.get("mem_hist_avg") else "")]
              for i, p in enumerate(top, 1)],
             align=["r", "l", "r", "r", "r", "r", "r", "r", "r"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 0])
     d.text("CPU in % of one vCPU core. Srv% = sustained CPU as share of total server capacity (used for ranking).")
@@ -2681,7 +2692,7 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
         if p.get("top_procs"):
             d.table(["PID", "Process", "State", "CPU now", "Memory", "Age"],
                     [[x["pid"], x["what"], x["state"], f"{x['cpu']:.0f}%", f"{fmt_mb(x['mem_mb'])} {x['mem_kind']}",
-                      f"{x['age_s'] // 86400}d" if x["age_s"] >= 86400 else f"{x['age_s'] // 60}m"] for x in p["top_procs"][:6]],
+                      fmt_age(x["age_s"])] for x in p["top_procs"][:6]],
                     align=["r", "l", "l", "r", "r", "r"], maxw=[0, 34, 0, 0, 0, 0])
             if p["fpm_procs_last"]:
                 d.text(f"PHP-FPM workers: {p['fpm_procs_last']} now, avg {fmt_mb(p['fpm_pss_mb'] / max(1, min(len(p['top_procs']), p['fpm_procs_last'])))} "
