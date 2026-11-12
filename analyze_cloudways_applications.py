@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -81,8 +81,10 @@ SLOW_HEADER_RE = re.compile(
 SLOW_SCRIPT_RE = re.compile(r"^script_filename\s*=\s*(.+)$")
 SLOW_FRAME_RE = re.compile(r"^\[0x[0-9a-fA-F]+\]\s+(.+?)\(\)\s+(.+?):(\d+)\s*$")
 POOL_SUFFIX_RE = re.compile(r"-\d{2}$")
-OOM_KILLED_RE = re.compile(r"Out of memory: Killed process (\d+) \(([^)]+)\)", re.I)
-OOM_INVOKED_RE = re.compile(r"(\S+) invoked oom-killer", re.I)
+OOM_KILLED_RE = re.compile(r"(?:Out of memory|Memory cgroup out of memory): Killed process (\d+) \(([^)]+)\)(.*)", re.I)
+OOM_INVOKED_RE = re.compile(r"(?:\]\s+|kernel:\s+)?(\S+) invoked oom-killer", re.I)
+OOM_KILLINFO_RE = re.compile(r"oom-kill:constraint=([A-Z_]+).*?(?:task_memcg=([^,]*),)?task=([^,]+),pid=(\d+),uid=(\d+)")
+OOM_FIELD_RE = re.compile(r"(total-vm|anon-rss|file-rss|shmem-rss):(\d+)kB|UID:(\d+)")
 SYSLOG_ISO_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?([+-]\d{2}:?\d{2}|Z)?")
 SYSLOG_CLASSIC_RE = re.compile(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})")
 CHROME_RE = re.compile(r"(?:chrome|crios|chromium)/(\d+)", re.I)
@@ -1293,42 +1295,106 @@ def parse_syslog_ts(line: str, now: datetime) -> datetime | None:
     return None
 
 
-def scan_oom(ctx: Ctx, start, end) -> dict:
-    events, seen, sources = [], set(), []
+def oom_owner(ctx: Ctx, apps: dict, comm: str, uid: int | None, cgroup: str) -> tuple[str, str]:
+    """Who owned the OOM victim: ('app', app) via the process UID, else ('service', name) via cgroup/name."""
+    if uid is not None:
+        user = uid_name(uid)
+        app = getattr(ctx, "user_to_app", {}).get(user) or (user if user in apps else None)
+        if app:
+            return "app", app
+    unit = cgroup.rstrip("/").split("/")[-1] if cgroup else ""
+    if unit.endswith(".service"):
+        base = unit[:-8]
+        for name, rx in SERVICE_PATTERNS:
+            if rx.match(base) or rx.match(comm):
+                return "service", name
+        if not re.match(r"^(user@|session-)", base):
+            return "service", base
+    for name, rx in SERVICE_PATTERNS:
+        if rx.match(comm):
+            return "service", name
+    return "other", comm + (f" (uid {uid_name(uid)})" if uid is not None else "")
+
+
+def parse_oom_lines(ctx: Ctx, apps: dict, lines, start, end) -> list[dict]:
+    """Join the kernel's 3 OOM lines (invoked / oom-kill / Killed process) into one event per kill."""
     now = utcnow()
-    for pattern in ("/var/log/kern.log*", "/var/log/syslog*", "/var/log/messages*"):
-        files = [f for f in files_for_window(pattern, start) if os.access(f, os.R_OK)]
+    events, seen = [], set()
+    trigger, info = None, {}
+    for line in lines:
+        if "oom" not in line and "Out of memory" not in line and "out of memory" not in line:
+            continue
+        mi = OOM_INVOKED_RE.search(line)
+        if mi and "invoked oom-killer" in line:
+            trigger = mi.group(1)
+            continue
+        mk = OOM_KILLINFO_RE.search(line)
+        if mk:
+            info[mk.group(4)] = {"constraint": mk.group(1), "cgroup": mk.group(2) or "", "uid": int(mk.group(5))}
+            continue
+        m = OOM_KILLED_RE.search(line)
+        if not m:
+            continue
+        ts = parse_syslog_ts(line, now)
+        if ts is not None and not in_window(ts, start, end):
+            continue
+        pid, comm, rest = m.group(1), m.group(2), m.group(3)
+        key = (pid, ts.strftime("%Y%m%d%H%M") if ts else "?")
+        if key in seen:
+            continue
+        seen.add(key)
+        fields, uid = {}, None
+        for f in OOM_FIELD_RE.finditer(rest):
+            if f.group(3):
+                uid = int(f.group(3))
+            else:
+                fields[f.group(1)] = int(f.group(2))
+        ki = info.pop(pid, {})
+        uid = uid if uid is not None else ki.get("uid")
+        kind, owner = oom_owner(ctx, apps, comm, uid, ki.get("cgroup", ""))
+        events.append({"time": ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "?", "pid": pid, "process": comm,
+                       "uid": uid, "user": uid_name(uid) if uid is not None else "", "owner_kind": kind, "owner": owner,
+                       "rss_mb": round((fields.get("anon-rss", 0) + fields.get("shmem-rss", 0)) / 1024, 1) if fields else None,
+                       "vm_mb": round(fields["total-vm"] / 1024, 1) if "total-vm" in fields else None,
+                       "cgroup": ki.get("cgroup", ""), "constraint": ki.get("constraint", ""),
+                       "memcg": "cgroup" in m.group(0).lower() or ki.get("constraint") == "CONSTRAINT_MEMCG",
+                       "trigger": trigger or ""})
+        trigger = None
+    return events
+
+
+def scan_oom(ctx: Ctx, start, end, apps: dict | None = None) -> dict:
+    apps = apps or {}
+    events, sources = [], []
+    for pattern in ctx.args.kernel_log_glob.split(","):
+        files = [f for f in files_for_window(pattern.strip(), start) if os.access(f, os.R_OK)]
         if not files:
             continue
         sources.extend(str(f) for f in files)
         for f in files:
-            for line in iter_lines(f):
-                if "Killed process" not in line and "invoked oom-killer" not in line:
-                    continue
-                ts = parse_syslog_ts(line, now)
-                if not in_window(ts, start, end):
-                    continue
-                m = OOM_KILLED_RE.search(line)
-                if m:
-                    key = (m.group(1), ts.strftime("%Y%m%d%H%M"))
-                    if key not in seen:
-                        seen.add(key)
-                        events.append({"time": ts.strftime("%Y-%m-%d %H:%M:%S"), "pid": m.group(1), "process": m.group(2)})
+            events.extend(parse_oom_lines(ctx, apps, iter_lines(f), start, end))
         break       # kern.log and syslog duplicate each other; use the first readable source
     if not sources:
         rc, out, _ = run_cmd(["journalctl", "-k", "--no-pager", "-o", "short-iso",
                               "--since", start.strftime("%Y-%m-%d %H:%M:%S") + " UTC"], timeout=20, ctx=ctx)
         if rc == 0:
             sources.append("journalctl -k")
-            for line in out.splitlines():
-                m = OOM_KILLED_RE.search(line)
-                if m:
-                    ts = parse_syslog_ts(line, now)
-                    events.append({"time": ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "?", "pid": m.group(1),
-                                   "process": m.group(2)})
+            events = parse_oom_lines(ctx, apps, out.splitlines(), start, end)
         else:
             ctx.note("Kernel logs (kern.log/syslog/journal) not readable - OOM events could not be checked (run as root).")
-    return {"events": events, "sources": sources, "by_process": Counter(e["process"] for e in events).most_common()}
+    by_owner = {}
+    for e in events:
+        o = by_owner.setdefault((e["owner_kind"], e["owner"]), {"kind": e["owner_kind"], "owner": e["owner"], "kills": 0,
+                                                                "max_rss_mb": 0.0, "processes": Counter(), "last": ""})
+        o["kills"] += 1
+        o["max_rss_mb"] = max(o["max_rss_mb"], e["rss_mb"] or 0)
+        o["processes"][e["process"]] += 1
+        o["last"] = max(o["last"], e["time"])
+    owners = sorted(by_owner.values(), key=lambda x: (-x["kills"], -x["max_rss_mb"]))
+    triggers = Counter(e["trigger"] for e in events if e["trigger"])
+    return {"events": events, "sources": sources, "by_process": Counter(e["process"] for e in events).most_common(),
+            "by_owner": owners, "triggers": triggers.most_common(5),
+            "memcg_kills": sum(1 for e in events if e["memcg"])}
 
 
 # ----------------------------------------------------------------------------
@@ -2383,6 +2449,7 @@ NEXT_ACTIONS = [
     ("concurrently running queries", "Inspect SHOW FULL PROCESSLIST during the peak; look for lock waits and slow fingerprints."),
     ("Long-running query", "Check whether it is expected (report/backup) or blocking others; do not kill without customer approval."),
     ("Elevated 5xx", "Check the app error log and PHP-FPM log for the 5xx timestamps."),
+    ("OOM killer killed this application", "Compare per-request memory x pm.max_children with free RAM; reduce memory_limit/heavy plugins or add RAM. Check the trigger process in the evidence."),
     ("OOM-killer", "Review memory sizing: max_children x per-request memory, MySQL buffer pool, Redis maxmemory; consider more RAM."),
     ("Sustained high server CPU", "Identify the top consumer above; if it is traffic-driven and legitimate, evaluate upscaling."),
     ("High CPU during live sampling", "Re-run with --minutes 10+ or review atop to confirm whether it is sustained."),
@@ -2662,6 +2729,21 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
                          [f"{b['requests']:,} requests; {len(bad)}/{len(b['verification']['checked'])} checked IPs failed"]
                          + [f"{c['ip']} -> {c['host'] or 'no PTR record'}" for c in bad[:3]], scenario="suspicious"))
 
+    # --- OOM kills of this application's processes
+    if p.get("oom"):
+        ks = p["oom"]
+        mx = max((e["rss_mb"] or 0) for e in ks)
+        fnd.append(F("memory", "critical", "Confirmed", "OOM killer killed this application's processes",
+                     [f"{len(ks)} kill(s); processes: " + ", ".join(f"{n} ({c})" for n, c in Counter(e["process"] for e in ks).most_common(3))
+                      + (f"; largest {fmt_mb(mx)} RSS at kill" if mx else "")]
+                     + [f"{e['time']} pid {e['pid']} {e['process']}" + (f" ({fmt_mb(e['rss_mb'])})" if e["rss_mb"] else "")
+                        + (f", triggered by {e['trigger']}" if e["trigger"] else "") + (" [cgroup limit]" if e["memcg"] else "")
+                        for e in ks[:3]],
+                     scenario="memory",
+                     metrics=[("OOM kills", len(ks)), ("Largest at kill", fmt_mb(mx) if mx else "n/a")]
+                     + ([("Memory per request", f"avg {fmt_mb(fa.get('avg_mem'))}, max {fmt_mb(fa.get('mem_max'))}")]
+                        if fa.get("requests") else [])))
+
     # --- Errors
     if t.get("total", 0) >= 200 and pct(t.get("errors_5xx", 0), t["total"]) >= 5:
         fnd.append(F("traffic", "warning", "Confirmed", "Elevated 5xx error rate",
@@ -2826,6 +2908,7 @@ def fmt_s(v) -> str:
 SCENARIO_TEXT = {
     "suspicious": "Suspicious / bot traffic is driving backend load",
     "bots": "Crawler / bot traffic is driving PHP load",
+    "memory": "Memory exhaustion (processes killed by the OOM killer)",
     "fpm": "PHP-FPM worker saturation is delaying requests",
     "database": "Database query performance is a bottleneck",
     "optimization": "Inefficient application (PHP) execution",
@@ -2839,7 +2922,7 @@ def decide_root_cause(p, fnd, server, suspicious) -> dict:
     for f in fnd:
         if f["scenario"] and f["confidence"] != "Inconclusive":
             by[f["scenario"]].append(f)
-    order = ["suspicious", "bots", "fpm", "database", "optimization", "cron", "traffic"]
+    order = ["suspicious", "bots", "memory", "fpm", "database", "optimization", "cron", "traffic"]
     primary = [s for s in order if by.get(s)]
     significant = p["tags"] != ["Normal"] or any(f["severity"] in ("critical", "high") for f in fnd)
     if primary and not significant:
@@ -2883,9 +2966,19 @@ def server_findings(ctx: Ctx, h: dict, services: dict, oom: dict, mysql: dict, r
     out = []
     hist = h.get("history") or {}
     if oom.get("events"):
-        out.append(F("server", "critical", "Confirmed", f"{len(oom['events'])} OOM-killer event(s) in the window",
-                     ["Killed: " + ", ".join(f"{p} ({c})" for p, c in oom["by_process"][:4])] +
-                     [f"{e['time']} {e['process']} (pid {e['pid']})" for e in oom["events"][:3]]))
+        owners = oom.get("by_owner") or []
+        ev = ["Killed by owner: " + ", ".join(
+            f"{o['kind']} {o['owner']} ({o['kills']}x" + (f", up to {fmt_mb(o['max_rss_mb'])}" if o["max_rss_mb"] else "") + ")"
+            for o in owners[:5])]
+        if oom.get("triggers"):
+            ev.append("Triggered by: " + ", ".join(f"{t} ({c})" for t, c in oom["triggers"][:3]))
+        if oom.get("memcg_kills"):
+            ev.append(f"{oom['memcg_kills']} kill(s) hit a cgroup memory limit (that service's limit), not total server RAM")
+        ev += [f"{e['time']} {e['process']} pid {e['pid']} -> {e['owner_kind']} {e['owner']}"
+               + (f", {fmt_mb(e['rss_mb'])} RSS" if e["rss_mb"] else "") for e in oom["events"][:3]]
+        out.append(F("server", "critical", "Confirmed", f"{len(oom['events'])} OOM-killer event(s) in the window", ev,
+                     metrics=[("OOM kills", len(oom["events"])),
+                              ("Most affected", f"{owners[0]['kind']} {owners[0]['owner']} ({owners[0]['kills']}x)" if owners else "-")]))
     cb = hist.get("cpu_busy") or (None, None)
     if cb[0] is not None and hist.get("intervals"):
         share_high = pct(hist["high_cpu_intervals"], hist["intervals"])
@@ -3027,6 +3120,13 @@ def recommendations(ctx: Ctx, profiles: list[dict], srv_findings: list[dict], h:
                   "A significant share of the application's server workload comes from automated crawlers (for example SEO and "
                   "AI bots) rather than visitors. We recommend limiting non-essential crawlers through bot management or rate-limiting "
                   "rules (for example Cloudflare bot rules) and robots.txt, while keeping legitimate search engines allowed.")
+        if "memory" in [rc["primary"]] + rc["secondary"]:
+            internal.append({"app": p["app"], "text": "Investigate OOM kills of this app: per-request memory x max_children, "
+                             "MySQL/Redis memory, and whether RAM must be increased", "evidence": ev_of("memory")[:3]})
+            add_c("oom", "Memory Exhaustion",
+                  "The server ran out of available memory and the operating system had to stop processes belonging to the "
+                  "application, which can cause errors or downtime for visitors. We recommend reducing the application's memory "
+                  "usage (for example heavy plugins, large imports or high PHP memory limits) or upgrading the server memory.")
         if "fpm" in [rc["primary"]] + rc["secondary"]:
             internal.append({"app": p["app"], "text": f"Investigate PHP-FPM worker saturation (pm.max_children={p.get('max_children', '?')}); "
                              "fix slow execution first, raise max_children only if RAM allows "
@@ -3457,7 +3557,9 @@ def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
            if p.get("cpu_live_avg") is not None else "n/a"),
           ("Memory", f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}" if p.get("mem_mb") is not None else "n/a"),
           ("PHP workers", f"{p.get('fpm_procs_last', 0)} running, busy peak {p['busy_peak']}, limit {p.get('max_children') or '?'}"
-                          + (f", limit reached {p['fpm_hits']}x" if p.get("fpm_hits") else ""))])
+                          + (f", limit reached {p['fpm_hits']}x" if p.get("fpm_hits") else "")),
+          ("Out-of-memory kills", (f"{len(p['oom'])} process(es) of this application stopped by the OS, last at {p['oom'][-1]['time']} UTC"
+                                   if p.get("oom") else "none in the window"))])
     # Traffic
     d.h3("Traffic")
     if t.get("total"):
@@ -3658,6 +3760,16 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
     for n in h.get("net", [])[:2]:
         rows.append((f"Network {n['dev']}", f"rx {n['rx_mbps']:.1f} / tx {n['tx_mbps']:.1f} Mbit/s"))
     d.kv(rows)
+    if R["oom"]["events"]:
+        d.h3("OOM killer events")
+        d.table(["Time (UTC)", "Killed process", "PID", "Owner", "Memory at kill", "Triggered by", "Scope"],
+                [[e["time"], e["process"], e["pid"], f"{e['owner_kind']}: {e['owner']}",
+                  fmt_mb(e["rss_mb"]) if e["rss_mb"] else "n/a", e["trigger"] or "-", "cgroup limit" if e["memcg"] else "server RAM"]
+                 for e in R["oom"]["events"][:15]],
+                align=["l", "l", "r", "l", "r", "l", "l"], maxw=[0, 16, 0, 26, 0, 16, 0])
+        if len(R["oom"]["events"]) > 15:
+            d.text(f"(+{len(R['oom']['events']) - 15} more OOM kills)")
+        d.text("Owner comes from the killed process's UID (app system user) or its systemd cgroup; memory = anon+shmem RSS at kill time.")
     d.h3("Resource attribution (live sampling)")
     attr = [[name, f"{s['cpu']:.0f}%", f"{s['cpu'] / NCPU:.0f}%", fmt_mb(s["mem_mb"]), f"{pct(s['mem_mb'], h.get('mem_total_mb') or 1):.0f}%"]
             for name, s in R["attribution"]]
@@ -3916,6 +4028,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip-history", action="store_true", help="Skip atop historical analysis")
     ap.add_argument("--explain", action="store_true", help="Run EXPLAIN (read-only) for top suspected full-scan SELECTs")
     ap.add_argument("--fpm-log-glob", default="/var/log/php*-fpm.log*")
+    ap.add_argument("--kernel-log-glob", default="/var/log/kern.log*,/var/log/syslog*,/var/log/messages*",
+                    help="Comma-separated kernel log globs searched (in order) for OOM kills; journalctl -k is the fallback")
     ap.add_argument("--pool-conf-glob", default="/etc/php/*/fpm/pool.d/*.conf,/etc/php-fpm.d/*.conf",
                     help="Comma-separated globs of PHP-FPM pool configs")
     ap.add_argument("--atop-timeout", type=float, default=90)
@@ -4089,7 +4203,10 @@ def investigate(args) -> tuple[Ctx, dict]:
         }
         p["tags"] = resource_tags(p, ctx)
 
-    oom = scan_oom(ctx, start, end) if not args.skip_health else {"events": [], "by_process": [], "sources": []}
+    oom = scan_oom(ctx, start, end, apps) if not args.skip_health else \
+        {"events": [], "by_process": [], "sources": [], "by_owner": [], "triggers": [], "memcg_kills": 0}
+    for p in top:
+        p["oom"] = [e for e in oom["events"] if e["owner_kind"] == "app" and e["owner"] == p["app"]]
     redis = redis_info(ctx) if not args.skip_health else None
     varnish = varnish_info(ctx) if not args.skip_health else None
     if args.skip_health:

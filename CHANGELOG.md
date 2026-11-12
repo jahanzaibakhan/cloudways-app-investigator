@@ -2,6 +2,19 @@
 
 All notable changes to `analyze_cloudways_applications.py`. The execution command and every existing flag stay compatible across versions.
 
+## 1.5.0 - 2026-11-12
+
+### Added
+- **OOM kill attribution.** The kernel's OOM lines (`… invoked oom-killer`, `oom-kill:… task_memcg=…,pid=…,uid=…`, `Out of memory: Killed process … anon-rss:… UID:…`) are joined per kill. Each kill now records:
+  - **owner:** the application, via the process UID = the app's system user; otherwise the **service**, via its systemd cgroup (e.g. `mariadb.service` → mysql) or process name
+  - **memory at kill** (anon+shmem RSS) and total VM
+  - the **trigger** process
+  - whether it hit a **cgroup memory limit** rather than total server RAM
+- **Server Health** shows an OOM table (time, process, PID, owner, memory at kill, trigger, scope). The server-wide CRITICAL finding now lists kills per owner ("app shop 3x up to 512 MB, service mysql 1x up to 1 GB") and the trigger.
+- **The affected app gets its own CRITICAL finding** ("OOM killer killed this application's processes"). It is therefore highlighted red throughout the report and gets a shareable app report with an "Out-of-memory kills" line and a "Memory Exhaustion" customer recommendation. It also has a new root-cause class: memory exhaustion.
+- `--kernel-log-glob` (default `kern.log*`, then `syslog*`, then `messages*`; `journalctl -k` as fallback).
+- 9 new exact checks: UID/cgroup/name attribution, memory and trigger parsing, duplicate syslog copies, window filtering, cgroup-limit kills, and the end-to-end CRITICAL block, OOM table and app report.
+
 ## 1.4.1 - 2026-11-12
 
 ### Fixed

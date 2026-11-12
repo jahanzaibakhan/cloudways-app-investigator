@@ -46,7 +46,7 @@ After the **Investigation Overview** (server, window, privileges, data sources):
    - **Shareable application report** for every CRITICAL/HIGH app: one self-contained block (and, with `--report`, one file per app) with that app's summary, findings, resources, traffic, bots, slow PHP requests, server errors, MySQL slow queries and the matching customer recommendations. It holds only that app's data and no internal notes, so it is ready to paste into the customer's ticket.
 3. **Top Resource-Consuming Applications**: CPU and memory live vs window average/peak, PHP and backend requests, busy/idle workers, profile tags
 4. **Top Bots Across the Server**: one ranking over all applications
-5. **Overall Server Health**: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
+5. **Overall Server Health**: CPU, load, memory, swap, iowait, steal, disks, an **OOM kill table** (each kill attributed to its application or service, with memory at kill, trigger and scope), PSI, CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
 6. **Application Traffic & Bot Analysis**: requests, req/min and req/s, unique IPs, top IPs/URLs/User-Agents, status codes, static vs dynamic, WordPress REST/admin-ajax/wp-login/xmlrpc/wp-cron, WooCommerce, attack indicators, and a per-app top-10 bot table with estimated PHP cost
 7. **PHP-FPM Investigation & Slow Requests**: pool config, workers, listen queue, max_children hits, timeouts, duration percentiles, per-app processes. Also the 10 slowest / highest-CPU / highest-memory requests (wall time vs CPU time vs wait), repeated slow URLs, 5xx responses, and plugin/theme involvement from slow logs.
 8. **MySQL / MariaDB Investigation**: connections, query rates, lock waits, deadlocks, running queries per database, and slow queries as top-10 slowest, top-10 by total time and most frequent, with database → app mapping
@@ -85,6 +85,7 @@ The report ends with the **Final Findings Summary**: Finding / Application / Sev
 | `--bot-requests-high` / `--bot-rpm-high` / `--bot-php-requests-high` | bot volume thresholds: requests per hour (5000), req/min (60), estimated PHP requests per hour (2000). Volume alone gives at most WARNING |
 | `--slow-request-seconds` / `--very-slow-request-seconds` / `--request-mem-high` | request flags SLOW (5s), HIGH (2x), VERY SLOW (30s), HIGH-MEM (256 MB) |
 | `--db-conn-high` | per-database connection peak flagged (default 40) |
+| `--kernel-log-glob G` | kernel logs searched for OOM kills, in order (default `/var/log/kern.log*,/var/log/syslog*,/var/log/messages*`; falls back to `journalctl -k`) |
 | `--help`, `--version` | usage and version |
 
 `--skip-health` is kept from the traffic analyzer for compatibility. Here it skips Redis/Varnish/OOM/filesystem checks; the WP health manager is never run. `--no-ip-lookup` is accepted and ignored, because this tool never sends visitor IPs to a third party.
@@ -273,6 +274,7 @@ This excerpt is from the synthetic test fixture (`tests/make_fixtures.py`), run 
 - **As non-root,** MySQL, atop, PSS, pool overrides and some logs are unavailable. The report lists each one.
 - **Bot PHP cost is estimated by client IP.** Humans and bots sharing an IP (NAT, proxies) blur it. Cloudflare-proxied sites need the real client IP in the logs, which Cloudways normally provides.
 - **DNS verification covers engines with published reverse-DNS domains.** DuckDuckBot, MJ12bot and most AI crawlers can't be verified this way and are labelled by User-Agent only.
+- **OOM attribution needs a kernel that logs the victim's UID or cgroup** (Linux 4.19+/5.x, Debian 10+). On older kernels the killed process name is still shown, but the owner falls back to the process name. Kills of PHP-FPM workers are attributed to the app through the pool user; if two apps shared a system user they couldn't be told apart, but Cloudways uses one user per app.
 - **Traffic analysis needs the Cloudways log layout** (`<app>/logs/backend_*.access.log` or the nginx access/status logs).
 
 ## Testing results
@@ -283,7 +285,7 @@ What was actually run (2026-11-12):
 |---|---|---|
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
-| `tests/test_exact_counts.py` (29 checks): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **29/29 pass** |
+| `tests/test_exact_counts.py` (38 checks, incl. OOM kill parsing and attribution by UID/cgroup, memory at kill, trigger, dedupe, window, and the end-to-end CRITICAL block / OOM table / app report): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **38/38 pass** |
 | `tests/test_scenarios.py` (27 checks, incl. per-app reports: one per CRITICAL/HIGH app, no other apps' data, no internal notes, one file each) | macOS, synthetic | **27/27 pass** |
 | ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
@@ -313,7 +315,7 @@ The `tests/` folder is for development only. Servers fetch just `analyze_cloudwa
 | `tests/run_tests.sh` | runs all of the below |
 | `tests/test_parsers_and_bots.py` | log parsers (real Cloudways line formats), SQL masking, pool includes, bot verification with a stubbed DNS resolver, bot rating |
 | `tests/test_root_cause.py` | root-cause and recommendation logic (traffic-driven + upscale, DB slowness causing FPM saturation, idle app) |
-| `tests/test_exact_counts.py` | 29 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
+| `tests/test_exact_counts.py` | 38 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
 | `tests/test_scenarios.py` | 27-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
 | `tests/make_fixtures.py` | builds a small synthetic Cloudways applications root (slow plugin, busy shop, wp-login brute force) |
 

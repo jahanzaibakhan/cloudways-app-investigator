@@ -174,7 +174,55 @@ def main() -> int:
                                                                  for x in ms["fingerprints"]), [x["fingerprint"] for x in ms["fingerprints"]])
         check("slowest single query is the 30s blog UPDATE", max(ms["fingerprints"], key=lambda x: x["max"])["db"] == "blog_db")
 
+        # --- OOM: join kernel lines, attribute by UID / cgroup / name, memory at kill, trigger, dedupe, window
+        def kl(tm, msg):
+            return f"{tm.strftime('%Y-%m-%dT%H:%M:%S')}.123456+00:00 web1 kernel: [12345.678] {msg}"
+        k1, k2, k3, k4 = T0 + timedelta(minutes=1), T0 + timedelta(minutes=2), T0 + timedelta(minutes=3), T0 + timedelta(minutes=4)
+        klines = [
+            kl(k1, "php-fpm8.3 invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0"),
+            kl(k1, "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,"
+                   "task_memcg=/system.slice/php8.3-fpm.service,task=php-fpm8.3,pid=4242,uid=1017"),
+            kl(k1, "Out of memory: Killed process 4242 (php-fpm8.3) total-vm:812000kB, anon-rss:524288kB, file-rss:0kB, "
+                   "shmem-rss:0kB, UID:1017 pgtables:1200kB oom_score_adj:0"),
+            kl(k1, "Out of memory: Killed process 4242 (php-fpm8.3) total-vm:812000kB, anon-rss:524288kB, file-rss:0kB, "
+                   "shmem-rss:0kB, UID:1017 pgtables:1200kB oom_score_adj:0"),                       # duplicate copy
+            kl(k2, "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,"
+                   "task_memcg=/system.slice/mariadb.service,task=mariadbd,pid=777,uid=106"),
+            kl(k2, "Out of memory: Killed process 777 (mariadbd) total-vm:2400000kB, anon-rss:1048576kB, file-rss:0kB, "
+                   "shmem-rss:0kB, UID:106 pgtables:3000kB oom_score_adj:0"),
+            kl(k3, "Memory cgroup out of memory: Killed process 888 (redis-server) total-vm:300000kB, anon-rss:204800kB, "
+                   "file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:500kB oom_score_adj:0"),
+            kl(OLD, "Out of memory: Killed process 999 (php-fpm8.3) total-vm:1kB, anon-rss:1kB, file-rss:0kB, shmem-rss:0kB, UID:1017"),
+            kl(k4, "systemd[1]: some unrelated line"),
+        ]
+        saved_uid_name = cw.uid_name
+        cw.uid_name = lambda uid, _m={1017: "shopuser", 106: "mysql", 107: "redis"}: _m.get(uid, str(uid))
+        ctx.user_to_app = {"shopuser": "shop"}
+        ev = cw.parse_oom_lines(ctx, apps, klines, start, end)
+        cw.uid_name = saved_uid_name
+        check("OOM: 3 kills (duplicate and out-of-window excluded)", len(ev) == 3, [(e["pid"], e["process"]) for e in ev])
+        e1, e2, e3 = ev
+        check("OOM: php-fpm kill attributed to app 'shop' via UID", (e1["owner_kind"], e1["owner"]) == ("app", "shop"), e1)
+        check("OOM: memory at kill 512 MB, trigger php-fpm8.3", e1["rss_mb"] == 512.0 and e1["trigger"] == "php-fpm8.3", e1)
+        check("OOM: mariadbd -> service mysql (cgroup), 1024 MB", (e2["owner_kind"], e2["owner"], e2["rss_mb"]) == ("service", "mysql", 1024.0), e2)
+        check("OOM: redis cgroup-limit kill flagged as memcg", e3["owner"] == "redis" and e3["memcg"], e3)
+
         # --- report formatting (full CLI run)
+        import os as _os
+        import pwd as _pwd
+        me = _pwd.getpwuid(_os.getuid()).pw_name
+        (apps_root / me / "logs").mkdir(parents=True)
+        (apps_root / me / "public_html").mkdir()
+        (apps_root / me / "logs" / f"backend_{me}.access.log").write_text(acc(T0, "81.2.3.4", "/", UA["human"]) + "\n")
+        klog = root / "kern.log"
+        klog.write_text("\n".join([
+            kl(k1, "php-fpm8.3 invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0"),
+            kl(k1, f"Out of memory: Killed process 4242 (php-fpm8.3) total-vm:812000kB, anon-rss:524288kB, file-rss:0kB, "
+                   f"shmem-rss:0kB, UID:{_os.getuid()} pgtables:1200kB oom_score_adj:0"),
+            kl(k2, "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,"
+                   "task_memcg=/system.slice/mariadb.service,task=mariadbd,pid=777,uid=106"),
+            kl(k2, "Out of memory: Killed process 777 (mariadbd) total-vm:2400000kB, anon-rss:1048576kB, file-rss:0kB, "
+                   "shmem-rss:0kB, UID:106 pgtables:3000kB oom_score_adj:0")]) + "\n")
         out = root / "out"
         out.mkdir()
         base = [sys.executable, str(SCRIPT), "--applications-root", str(apps_root), "--strict-root", "--sample-seconds", "4",
@@ -196,7 +244,16 @@ def main() -> int:
                     j += 1
         check("markdown export: tables well-formed, no ANSI", r2.returncode == 0 and not bad and "\x1b[" not in md, bad[:3])
         js = json.loads(next(out.glob("*.json")).read_text())
-        check("json export parses and has census", js.get("census", {}).get("total") == 120)
+        check("json export parses and has census", js.get("census", {}).get("total") == 121)
+        r3 = subprocess.run(base + ["--top", "3", "--no-color", "--kernel-log-glob", str(klog)], capture_output=True, text=True, timeout=120)
+        o3 = r3.stdout
+        crit = o3[o3.find("1. CRITICAL FINDINGS"):o3.find("2. HIGH-PRIORITY FINDINGS")]
+        check("OOM table in server health with owners", "OOM killer events" in o3 and f"app: {me}" in o3 and "service: mysql" in o3,
+              r3.stderr[-200:])
+        check("OOM-killed app listed under CRITICAL with its name", "OOM KILLER KILLED THIS APPLICATION" in crit and me in crit)
+        check("OOM-killed app gets a shareable app report with OOM line",
+              f"APPLICATION REPORT: {me}" in o3 and "Out-of-memory kills" in o3 and "Memory Exhaustion" in o3)
+        check("server OOM finding names owners and trigger", "Killed by owner:" in o3 and "Triggered by: php-fpm8.3" in o3)
         print(f"\n{sum(results)}/{len(results)} exact checks passed")
         return 0 if all(results) else 1
     finally:
