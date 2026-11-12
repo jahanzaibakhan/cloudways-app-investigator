@@ -14,4 +14,4 @@ grep -A1 "▸ slowblog" "$tmp/report.txt" | grep -q .
 awk '/8. ROOT CAUSE/,/9. INTERNAL/' "$tmp/report.txt" > "$tmp/rc.txt"
 grep -q "Inefficient application (PHP) execution" "$tmp/rc.txt" && grep -q "Suspicious / bot traffic" "$tmp/rc.txt" \
   && echo "PASS end-to-end report"
-python3 "$here/test_matrix.py" | tail -1
+python3 "$here/test_matrix.py" > "$tmp/matrix.txt" || { grep -v "^PASS" "$tmp/matrix.txt"; exit 1; }; tail -1 "$tmp/matrix.txt"

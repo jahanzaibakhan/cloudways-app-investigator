@@ -2579,7 +2579,8 @@ def calibrate_app_severity(ctx: Ctx, p: dict, fnd: list, h: dict):
             sev = "info"
         elif _has(f, "attack activity"):
             sev = ("critical" if saturated or srv_busy >= 85 else "high") if f["confidence"] == "Likely" else "warning"
-            idle = p["tags"] == ["Normal"] and (t.get("avg_rpm") or 0) < a.attack_min_rpm and not saturated
+            abuse = {x["key"] for x in p.get("traffic_signals", [])} & {"login_bruteforce", "xmlrpc_abuse", "impersonation", "admin_hammer"}
+            idle = p["tags"] == ["Normal"] and (t.get("avg_rpm") or 0) < a.attack_min_rpm and not saturated and not abuse
             if idle:      # pattern without load: an observation, not an alert
                 sev = "warning" if f["confidence"] == "Likely" else "info"
                 f["evidence"] = f["evidence"] + [f"Low impact: {t.get('avg_rpm', 0):.0f} req/min and no resource pressure on this app"]
