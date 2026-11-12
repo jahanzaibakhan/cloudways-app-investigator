@@ -103,3 +103,27 @@ assert cw.ANSI_CODE_RE.sub("", txt) == plain
 assert "\x1b[1;31m\x1b[4mshopapp" in txt and "\x1b[1;38;5;208m\x1b[4mblogapp" in txt and "\x1b[4mshopapp2" not in txt
 assert "\x1b[" not in plain and "\x1b[" not in d.render("markdown", False)
 print("highlight ok")
+
+# --- Chrome version estimate (regression: 40.5-day cadence flagged current Chrome 148+ as "spoofed")
+from datetime import datetime as _dt
+est = cw.estimate_latest_chrome(_dt(2026, 11, 12))
+assert 152 <= est <= 157, est
+assert cw.estimate_latest_chrome(_dt(2025, 10, 28)) in range(140, 145)      # Chrome 142 shipped 2025-10-28
+print("chrome-estimate ok", est)
+# --- real log lines through analyze_traffic: current Chrome is a browser, only outdated/future versions are flagged
+import tempfile as _tf
+from datetime import timedelta as _td
+_root = Path(_tf.mkdtemp()); (_root / "a" / "logs").mkdir(parents=True); (_root / "a" / "public_html").mkdir()
+_now = cw.utcnow()
+_lines = []
+for _i, _v in enumerate([150] * 6 + [60] * 3 + [200] * 2):
+    _t = (_now - _td(minutes=5) + _td(seconds=_i)).strftime("%d/%b/%Y:%H:%M:%S +0000")
+    _lines.append(f'81.2.3.{_i} - - [{_t}] "GET / HTTP/1.1" 200 1 "-" "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/{_v}.0.0.0 Safari/537.36"')
+(_root / "a" / "logs" / "backend_a.access.log").write_text("\n".join(_lines) + "\n")
+_args = cw.build_parser().parse_args([]); _ctx = cw.Ctx(_args)
+_t = cw.analyze_traffic(_ctx, cw.collect_apps([_root])["a"], _now - _td(hours=1), _now + _td(minutes=1))
+_names = {b["name"]: b["requests"] for b in _t["bots"]}
+assert _t["total"] == 11 and _t["bot_requests"] == 5, (_t["total"], _names)
+assert any(n.startswith("Outdated Chrome") and c == 3 for n, c in _names.items()), _names
+assert any(n.startswith("Future Chrome") and c == 2 for n, c in _names.items()), _names
+print("chrome-ua-classification ok", _names)

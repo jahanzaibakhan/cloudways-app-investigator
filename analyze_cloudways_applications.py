@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -1488,8 +1488,12 @@ class BotVerifier:
 # ----------------------------------------------------------------------------
 # Traffic analysis (backend = requests that passed Varnish to Apache/PHP)
 # ----------------------------------------------------------------------------
+CHROME_DAYS_PER_MAJOR = 30.5     # Chrome stable ships a new major roughly every 4 weeks (126 = 2024-06-11, 142 = 2025-10-28)
+CHROME_CHANNEL_LEAD = 3          # Beta/Dev/Canary run up to 3 majors ahead of stable - not "non-existent"
+
+
 def estimate_latest_chrome(now: datetime) -> int:
-    return 126 + max(0, int((now - datetime(2024, 6, 11)).days / 40.5))
+    return 126 + max(0, int((now - datetime(2024, 6, 11)).days / CHROME_DAYS_PER_MAJOR))
 
 
 def ua_class(ua: str) -> str:
@@ -1571,9 +1575,12 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
             cm = CHROME_RE.search(ua)
             if cm:
                 v = int(cm.group(1))
-                if v > latest_chrome or v <= latest_chrome - ctx.args.chrome_obsolete_margin:
+                if v > latest_chrome + CHROME_CHANNEL_LEAD:
                     chrome_bad += 1
-                    spoofed = True
+                    spoofed = "future"
+                elif v <= latest_chrome - ctx.args.chrome_obsolete_margin:
+                    chrome_bad += 1
+                    spoofed = "outdated"
                 if "headless" in ua.lower():
                     headless += 1
             minute = ts.replace(second=0)
@@ -1586,7 +1593,8 @@ def analyze_traffic(ctx: Ctx, app: dict, start, end) -> dict:
                 store_api += 1
             bot = identify_bot(ua)
             if bot is None and spoofed and uc == "browser":
-                bot = ("Outdated/spoofed browser UA", "suspicious", None)
+                bot = ((f"Future Chrome UA (> v{latest_chrome + CHROME_CHANNEL_LEAD})", "suspicious", None) if spoofed == "future"
+                       else (f"Outdated Chrome UA (<= v{latest_chrome - ctx.args.chrome_obsolete_margin})", "suspicious", None))
             if bot:
                 b = bots.get(bot[0])
                 if b is None:
@@ -3312,9 +3320,10 @@ def render_server_bots(d: "Doc", R: dict):
             [[b["name"], b["category_label"], f"{b['requests']:,}", f"{b['pct']:.1f}%", f"{b['rpm']:.1f}", b["unique_ips"],
               f"{b['dynamic']:,}", b["app_count"], b["apps"][0][0] if b["apps"] else "-"] for b in c["bots"]],
             align=["l", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[24, 28, 0, 0, 0, 0, 0, 0, 12])
-    for b in c["bots"][:3]:
-        d.bullet(f"{b['name']}: top URLs " + ", ".join(f"{u} ({n:,})" for u, n in b["top_urls"]) +
-                 " | status " + ", ".join(f"{k}:{v:,}" for k, v in b["status"]), None)
+    for b in c["bots"][:5]:
+        d.bullet(f"{b['name']}: top IPs " + ", ".join(f"{ip} ({n:,})" for ip, n in b["top_ips"][:4]), None)
+        d.bullet("top URLs " + ", ".join(f"{u} ({n:,})" for u, n in b["top_urls"]) +
+                 " | status " + ", ".join(f"{k}:{v:,}" for k, v in b["status"]), None, 1)
     d.text("Category is from the User-Agent; search engines are 'verified' only after reverse+forward DNS succeeds. "
            "Per-app PHP cost of each bot is in section 6.")
 
@@ -3342,6 +3351,9 @@ def render_bots(d: "Doc", p: dict):
               b["unique_ips"], f"{pct(b['dynamic'], b['requests']):.0f}%", f"{b.get('php_cpu_share', 0):.0f}%", b.get("level", "-")]
              for b in bots[:12]],
             align=["l", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[26, 30, 0, 0, 0, 0, 0, 0, 0])
+    for b in bots[:10]:
+        if not (b.get("level") in ("HIGH", "WARNING") or b.get("impersonation")):
+            d.bullet(f"{b['name']} top IPs: " + ", ".join(f"{ip} ({n:,})" for ip, n in b["top_ips"]), None)
     for b in [b for b in bots if b.get("level") in ("HIGH", "WARNING") or b.get("impersonation")][:4]:
         d.bullet(f"{b['name']} ({b['level']}): {b['requests']:,} requests, peak {b['peak_rpm']}/min, "
                  f"{b['dynamic']:,} dynamic / {b['static']:,} static"
@@ -3469,10 +3481,15 @@ def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
     bots = t.get("bots") or []
     if bots:
         d.h3("Bots and crawlers")
-        d.table(["Bot", "Type", "Requests", "Share", "/min", "Dynamic %", "Est. PHP CPU"],
+        d.table(["Bot", "Type", "Requests", "Share", "/min", "IPs", "Dynamic %", "Est. PHP CPU"],
                 [[b["name"], b.get("category_label", b["category"]), f"{b['requests']:,}", f"{b['pct']:.0f}%", f"{b['rpm']:.1f}",
-                  f"{pct(b['dynamic'], b['requests']):.0f}%", f"{b.get('php_cpu_share', 0):.0f}%"] for b in bots[:6]],
-                align=["l", "l", "r", "r", "r", "r", "r"], maxw=[24, 28, 0, 0, 0, 0, 0])
+                  f"{b['unique_ips']:,}", f"{pct(b['dynamic'], b['requests']):.0f}%", f"{b.get('php_cpu_share', 0):.0f}%"]
+                 for b in bots[:6]],
+                align=["l", "l", "r", "r", "r", "r", "r", "r"], maxw=[30, 26, 0, 0, 0, 0, 0, 0])
+        for b in bots[:6]:
+            d.bullet(f"{b['name']} - top IPs: " + ", ".join(f"{ip} ({n:,})" for ip, n in b["top_ips"]), None)
+            if b["category"] == "suspicious" and b.get("ua_sample"):
+                d.bullet(f"example User-Agent: {b['ua_sample']}", None, 1)
     # Slow PHP
     d.h3("Slow PHP requests")
     if fa.get("requests"):

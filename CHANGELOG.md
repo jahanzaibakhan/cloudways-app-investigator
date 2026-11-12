@@ -2,6 +2,18 @@
 
 All notable changes to `analyze_cloudways_applications.py`. The execution command and every existing flag stay compatible across versions.
 
+## 1.4.1 - 2026-11-12
+
+### Fixed
+- **False "Outdated/spoofed browser" traffic:** the newest real Chrome was estimated with a 40.5-day release cadence, inherited from the original traffic analyzer, giving v147 for Nov 2026. Chrome actually ships about every 4 weeks (about v154), so visitors on current Chrome 148+ were counted as spoofed; one report showed 95% of an app's traffic that way. The estimate now uses 30.5 days, and versions are only "future/non-existent" more than 3 majors ahead of stable (Beta/Dev/Canary). `--chrome-latest-major` still overrides.
+- The single "Outdated/spoofed browser UA" bucket is split into **"Outdated Chrome UA (<= vN)"** and **"Future Chrome UA (> vN)"**, with the cutoff version in the name so the classification can be sanity-checked.
+
+### Added
+- **Bot IPs everywhere:**
+  - app reports: an IPs column, plus the top IPs (with request counts) of each bot, and an example User-Agent for suspicious buckets
+  - section 6: top IPs for every listed bot, not only flagged ones
+  - server-wide ranking: top IPs for the top 5 bots
+
 ## 1.4.0 - 2026-11-12
 
 ### Added
