@@ -89,6 +89,39 @@ The report ends with the **Final Findings Summary**: Finding / Application / Sev
 
 `--skip-health` is kept from the traffic analyzer for compatibility. Here it skips Redis/Varnish/OOM/filesystem checks; the WP health manager is never run. `--no-ip-lookup` is accepted and ignored, because this tool never sends visitor IPs to a third party.
 
+## Output options compared
+
+These options control different things and can be combined. The investigation itself (sampling, logs, MySQL, analysis) is identical with all of them; they only change what is shown and saved.
+
+| Option | What it changes | Where it goes | Report content |
+|---|---|---|---|
+| *(none)* | nothing; the default | stdout | full report (all sections + shareable app reports) |
+| `--progress` | adds timestamped **status messages while the script runs** (`[ 12.3s] Live resource sampling…`) | **stderr** | unchanged; never in saved files |
+| `--verbose` | everything `--progress` shows, plus debug lines (failed queries, timeouts, data notes as they happen) | stderr | unchanged |
+| `--app-reports-only` | prints **only the shareable reports** for CRITICAL/HIGH apps, or one line saying there are none | stdout | the other sections are not printed (they are still computed, and still saved with `--report`) |
+| `--no-app-reports` | leaves the shareable app reports out | stdout and saved files | full report without the app blocks |
+| `--report` | saves to `--output-dir` (default `/tmp`, mode 600) | files | the full report **plus** one `cloudways_app_<app>_<ts>` file per CRITICAL/HIGH app, even with `--app-reports-only` |
+| `--json` | also saves machine-readable results | file | all collected data |
+| `--format markdown` | Markdown instead of plain text, for Jira/GitHub | stdout and saved files | same content |
+| `--no-color` | no ANSI colours, and no red/orange app-name highlighting | stdout | same content |
+
+**`--progress` vs `--app-reports-only` in one line:** `--progress` tells you what the script is *doing* while it runs; `--app-reports-only` decides *which report* you see at the end.
+
+Typical combinations:
+
+```bash
+U=https://raw.githubusercontent.com/jahanzaibakhan/cloudways-app-investigator/main/analyze_cloudways_applications.py
+
+# watch progress, read the full report on screen
+curl -sS "$U" | python3 - --top 5 --hour 1 --progress
+
+# only what you will paste to the customer, plus all files saved for the internal ticket
+curl -sS "$U" | python3 - --top 5 --hour 1 --progress --app-reports-only --report
+
+# progress on screen, clean report into a file (progress goes to stderr, so it doesn't end up in the file)
+curl -sS "$U" | python3 - --top 5 --hour 1 --progress --no-color > /tmp/investigation.txt
+```
+
 ## Bot & crawler analysis
 
 Each top application gets a bot table (Bot, Category, Requests, Share, /min, IPs, Dynamic %, est. PHP CPU, Status). HIGH and WARNING bots also get their top IPs, URLs, status codes and DNS verification result.
