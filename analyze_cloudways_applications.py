@@ -2579,6 +2579,10 @@ def calibrate_app_severity(ctx: Ctx, p: dict, fnd: list, h: dict):
             sev = "info"
         elif _has(f, "attack activity"):
             sev = ("critical" if saturated or srv_busy >= 85 else "high") if f["confidence"] == "Likely" else "warning"
+            idle = p["tags"] == ["Normal"] and (t.get("avg_rpm") or 0) < a.attack_min_rpm and not saturated
+            if idle:      # pattern without load: an observation, not an alert
+                sev = "warning" if f["confidence"] == "Likely" else "info"
+                f["evidence"] = f["evidence"] + [f"Low impact: {t.get('avg_rpm', 0):.0f} req/min and no resource pressure on this app"]
         elif _has(f, "impersonation"):
             sev = "high"
         elif _has(f, "worker exhaustion"):
@@ -3507,6 +3511,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dns-verify-max", type=int, default=60, help="Max IPs to DNS-verify per run (default 60)")
     ap.add_argument("--bot-share-high", type=float, default=25, help="Bot share of backend requests flagged HIGH (default 25%%)")
     ap.add_argument("--bot-share-warn", type=float, default=10, help="Bot share flagged WARNING (default 10%%)")
+    ap.add_argument("--attack-min-rpm", type=float, default=60,
+                    help="Below this backend req/min on a non-loaded app, attack patterns are reported as INFO/WARNING only (default 60)")
     ap.add_argument("--bot-high-cpu", type=float, default=5,
                     help="Bot PHP CPU (%% of one core, window average) required for HIGH (default 5)")
     ap.add_argument("--bot-min-cpu", type=float, default=2,

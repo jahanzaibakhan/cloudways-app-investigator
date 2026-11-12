@@ -65,6 +65,7 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 | `--bot-share-high` / `--bot-share-warn` | bot share of backend requests rated HIGH / WARNING (default 25% / 10%) |
 | `--bot-high-cpu` / `--bot-min-cpu` | bot PHP CPU (% of one core, window avg) needed for HIGH / below which a bot under 60 req/min is never flagged (default 5 / 2) |
 | `--cpu-high` / `--cpu-critical` / `--mem-high` | app severity thresholds as % of server capacity / RAM (default 40 / 70 / 30) |
+| `--attack-min-rpm` | below this backend req/min on an app without resource pressure, attack patterns are downgraded to INFO (Suspected) / WARNING (Likely) (default 60) |
 | `--php-rpm-per-core-warn` | PHP requests/min per vCPU considered high volume (default 120) |
 | `--help`, `--version` | usage and version |
 
