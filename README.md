@@ -175,7 +175,7 @@ live /proc sampling (N samples) ──► atop history (window) ──► rank a
 
 ## Example output
 
-This excerpt is from the synthetic test fixture (`tests/mkfix.py`), run on macOS, so the live `/proc` columns show `n/a`. On a Linux server they are filled in.
+This excerpt is from the synthetic test fixture (`tests/make_fixtures.py`), run on macOS, so the live `/proc` columns show `n/a`. On a Linux server they are filled in.
 
 ```
 3. TOP 3 RESOURCE-CONSUMING APPLICATIONS
@@ -232,7 +232,7 @@ What was actually run (2026-11-12):
 |---|---|---|
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
-| `tests/test_matrix.py` (23 checks) | macOS, synthetic | **23/23 pass** |
+| `tests/test_scenarios.py` (23 checks) | macOS, synthetic | **23/23 pass** |
 | ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
 | ↳ low-traffic / high-CPU app ranked #1, root cause = optimization | | pass |
@@ -251,10 +251,20 @@ What was actually run (2026-11-12):
 ## Development
 
 ```bash
-tests/run_tests.sh      # offline: parsers, DNS-verify stubs, RCA scenarios, end-to-end report, 23-check scenario matrix
+tests/run_tests.sh      # runs everything offline; exits non-zero on any failure - run before every push
 ```
 
-`tests/mkfix.py` generates a synthetic Cloudways applications root with three cases: a slow-plugin app, a normal busy shop, and a wp-login brute-force target. To test changes on a real server without copying files, push a branch and run:
+The `tests/` folder is for development only. Servers fetch just `analyze_cloudways_applications.py` with `curl`, so this folder never reaches them.
+
+| File | What it checks |
+|---|---|
+| `tests/run_tests.sh` | runs all of the below |
+| `tests/test_parsers_and_bots.py` | log parsers (real Cloudways line formats), SQL masking, pool includes, bot verification with a stubbed DNS resolver, bot rating |
+| `tests/test_root_cause.py` | root-cause and recommendation logic (traffic-driven + upscale, DB slowness causing FPM saturation, idle app) |
+| `tests/test_scenarios.py` | 23-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
+| `tests/make_fixtures.py` | builds a small synthetic Cloudways applications root (slow plugin, busy shop, wp-login brute force) |
+
+To test changes on a real server without copying files there, push a branch and run:
 
 ```bash
 curl -sS https://raw.githubusercontent.com/jahanzaibakhan/cloudways-app-investigator/<branch-or-sha>/analyze_cloudways_applications.py | sudo python3 - --top 5 --hour 1
