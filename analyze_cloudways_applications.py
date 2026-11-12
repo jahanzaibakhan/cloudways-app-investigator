@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -3093,9 +3093,13 @@ SEV_NAME = {"critical": "CRITICAL", "high": "HIGH", "warning": "WARNING", "info"
 W = 78
 
 
+ANSI_CODE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 class Doc:
     def __init__(self):
         self.blocks = []
+        self.highlight: dict[str, str] = {}      # app name/domain -> severity (terminal colouring only)
 
     def h1(self, t): self.blocks.append(("h1", t))
     def h2(self, t): self.blocks.append(("h2", t))
@@ -3155,7 +3159,28 @@ class Doc:
                 out.append(self._c("=" * W, col, color))
                 if b[1]:
                     out += [self._c(b[1].center(W), col, color), self._c("=" * W, col, color)]
+        if color and self.highlight:
+            out = [self._highlight_line(ln) for ln in out]
         return "\n".join(out) + "\n"
+
+    def _highlight_line(self, line: str) -> str:
+        """Colour every CRITICAL/HIGH app name (and domain) in its severity colour, restoring the line colour after it."""
+        if not hasattr(self, "_hl_re"):
+            names = sorted(self.highlight, key=len, reverse=True)
+            self._hl_re = re.compile(r"(?<![\w.-])(" + "|".join(re.escape(n) for n in names) + r")(?![\w-])") if names else None
+        if self._hl_re is None or not self._hl_re.search(line):
+            return line
+        res, pos, active = [], 0, ""
+        for m in self._hl_re.finditer(line):
+            seg = line[pos:m.start()]
+            codes = ANSI_CODE_RE.findall(seg)
+            for c in codes:
+                active = "" if c == ANSI["reset"] else active + c
+            col = ANSI[SEV_COLOR[self.highlight[m.group(1)]]]
+            res.append(seg + ANSI["reset"] + col + "\033[4m" + m.group(1) + ANSI["reset"] + active)
+            pos = m.end()
+        res.append(line[pos:])
+        return "".join(res)
 
     def _md(self) -> str:
         out = []
@@ -3385,6 +3410,122 @@ def render_slow_requests(d: "Doc", p: dict, a):
                 [[c, k, f"{pct(k, tot):.0f}%"] for c, k in sl["components"].most_common(8)], maxw=[44, 0, 0])
 
 
+def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
+    """Everything about one CRITICAL/HIGH application in one customer-shareable block.
+
+    Contains only this application's own data: no other applications, no internal PlatformOps notes.
+    """
+    sev = R.get("priority_apps", {}).get(p["app"], "warning")
+    t, fa, sl = p.get("traffic") or {}, p.get("fpm") or {}, p.get("slow") or {}
+    db = p.get("mysql") or {}
+    name = p["app"] + (f" ({p['domain']})" if p.get("domain") else "")
+    d.banner(f"APPLICATION REPORT: {name} [{SEV_NAME[sev]}]", sev)
+    d.text(">>> BEGIN SHAREABLE APPLICATION REPORT >>>")
+    d.kv([("Application", name), ("Type", p.get("type") or "-"), ("Window", R["window_desc"]),
+          ("Generated", R["generated"] + " UTC")])
+    # Summary & root cause
+    d.h3("Summary")
+    for ln in p.get("summary", []):
+        d.text(ln)
+    rc = p.get("root_cause") or {}
+    d.kv([("Root cause", rc.get("text", "-")), ("Confidence", rc.get("confidence", "-"))])
+    # Findings
+    d.h3("Findings")
+    shown = [f for f in p.get("findings", []) if f["severity"] in ("critical", "high", "warning")]
+    for f in shown or p.get("findings", [])[:3]:
+        d.bullet(f"{f['text']} (confidence: {f['confidence']})", f["severity"])
+        for e in [e for e in f["evidence"] if " thresholds: " not in e][:3]:    # internal threshold detail stays out
+            d.bullet(e, None, 1)
+    if not p.get("findings"):
+        d.text("No findings.")
+    # Resource usage
+    d.h3("Resource usage")
+    d.kv([("CPU (window avg)", f"{p['cpu_sustained']:.0f}% of one CPU core ({p['cpu_server_share']:.0f}% of server capacity)"),
+          ("CPU (live sample)", f"avg {p['cpu_live_avg']:.0f}% / peak {p['cpu_live_peak']:.0f}% of one core"
+           if p.get("cpu_live_avg") is not None else "n/a"),
+          ("Memory", f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}" if p.get("mem_mb") is not None else "n/a"),
+          ("PHP workers", f"{p.get('fpm_procs_last', 0)} running, busy peak {p['busy_peak']}, limit {p.get('max_children') or '?'}"
+                          + (f", limit reached {p['fpm_hits']}x" if p.get("fpm_hits") else ""))])
+    # Traffic
+    d.h3("Traffic")
+    if t.get("total"):
+        cats = dict(t["categories"])
+        d.kv([("Requests reaching the server", f"{t['total']:,} ({t['avg_rpm']:.1f}/min avg, peak {t['peak_rpm']:,}/min at {t['peak_rpm_at']} UTC)"),
+              ("Dynamic (PHP) requests", f"{p['php_requests']:,}"),
+              ("Unique visitor IPs", f"{t['unique_ips']:,}"),
+              ("Status codes", ", ".join(f"{k}: {v:,}" for k, v in t["status"])),
+              ("WordPress", f"REST {cats.get('rest-api', 0) + cats.get('wc-rest', 0):,}, admin-ajax {cats.get('admin-ajax', 0):,}, "
+                            f"wp-login {cats.get('wp-login', 0):,}, xmlrpc {cats.get('xmlrpc', 0):,}, wp-cron {cats.get('wp-cron', 0):,}, "
+                            f"WooCommerce {cats.get('woocommerce', 0):,}")])
+        d.table(["Most requested URL", "Requests", "%"], [[x["url"], f"{x['requests']:,}", f"{x['pct']:.1f}%"] for x in t["top_urls"][:5]],
+                maxw=[56, 0, 0])
+        d.table(["Top visitor IP", "Requests", "%", "Mostly"], [[x["ip"], f"{x['requests']:,}", f"{x['pct']:.1f}%", x["top_target"]]
+                                                                for x in t["top_ips"][:5]], align=["l", "r", "r", "l"])
+        for sg in p.get("traffic_signals", []):
+            d.bullet(sg["text"], "warning")
+    else:
+        d.text("No access-log traffic in the window.")
+    # Bots
+    bots = t.get("bots") or []
+    if bots:
+        d.h3("Bots and crawlers")
+        d.table(["Bot", "Type", "Requests", "Share", "/min", "Dynamic %", "Est. PHP CPU"],
+                [[b["name"], b.get("category_label", b["category"]), f"{b['requests']:,}", f"{b['pct']:.0f}%", f"{b['rpm']:.1f}",
+                  f"{pct(b['dynamic'], b['requests']):.0f}%", f"{b.get('php_cpu_share', 0):.0f}%"] for b in bots[:6]],
+                align=["l", "l", "r", "r", "r", "r", "r"], maxw=[24, 28, 0, 0, 0, 0, 0])
+    # Slow PHP
+    d.h3("Slow PHP requests")
+    if fa.get("requests"):
+        d.kv([("PHP requests", f"{fa['requests']:,}"),
+              ("Duration", f"avg {fmt_s(fa.get('avg_dur'))}, p95 {fmt_s(fa.get('p95'))}, max {fmt_s(fa.get('max_dur'))}"),
+              ("Requests >= 5s / >= 30s", f"{fa.get('over', {}).get(5, 0):,} / {fa.get('over', {}).get(30, 0):,}"),
+              ("Memory per request", f"avg {fmt_mb(fa.get('avg_mem'))}, max {fmt_mb(fa.get('mem_max'))}")])
+        if fa.get("slowest_requests"):
+            d.table(["Time (UTC)", "Status", "Duration s", "CPU s", "Waiting", "MB", "URL (slowest)"],
+                    [[r["time"], r["status"], f"{r['dur']:.2f}", f"{r['cpu_s']:.2f}", f"{max(0.0, 100 - r['cpu_pct']):.0f}%",
+                      f"{r['mem']:.0f}", r["uri"]] for r in fa["slowest_requests"][:5]],
+                    align=["l", "l", "r", "r", "r", "r", "l"], maxw=[0, 0, 0, 0, 0, 0, 44])
+        if fa.get("repeated_slow_paths"):
+            d.table(["Repeatedly slow URL", "Slow requests", "Avg s", "Max s"],
+                    [[x["path"], x["slow_hits"], x["avg_slow_s"], x["max_s"]] for x in fa["repeated_slow_paths"][:5]], maxw=[50, 0, 0, 0])
+        if sl.get("components"):
+            d.text("Plugins/themes seen in slow-request traces: " +
+                   ", ".join(f"{c} ({k})" for c, k in sl["components"].most_common(5)))
+        errs = fa.get("fpm_5xx", []) + t.get("http_5xx", [])
+        if errs:
+            d.text("Server errors: " + ", ".join(f"{x['status']} {x['path']} ({x['count']:,})" for x in errs[:6]))
+    else:
+        d.text("No PHP-FPM access-log data in the window.")
+    # MySQL
+    d.h3("Database (MySQL) slow queries")
+    sdb, fps = db.get("slow"), [x for x in db.get("fingerprints", []) if not x["dump"]]
+    if sdb:
+        d.kv([("Database", p["db"]), ("Slow queries", f"{sdb['count']:,} (total {sdb['time']:.0f}s, max {sdb['max']:.1f}s)")])
+        if fps:
+            d.table(["Count", "Total s", "Avg s", "Max s", "Rows examined", "Query pattern (values masked)"],
+                    [[x["count"], f"{x['time']:.0f}", f"{x['avg']:.1f}", f"{x['max']:.1f}", f"{x['avg_rows_ex']:,.0f}", x["fingerprint"]]
+                     for x in fps[:5]], maxw=[0, 0, 0, 0, 0, 54])
+    else:
+        d.text("No slow queries recorded for this application's database in the window."
+               if R["mysql"].get("available") else "Database data was not available for this investigation.")
+    live = db.get("live")
+    if live:
+        d.text(f"Database connections during sampling: avg {live['conn_avg']:.1f}, peak {live['conn_peak']}; "
+               f"running queries peak {live['running_peak']}.")
+    # Recommendations that apply to this app (customer wording only)
+    labels = {p["app"], p.get("domain") or ""}
+    recs = [c for c in R["customer"] if set(c.get("apps") or []) & labels]
+    d.h3("Recommendations")
+    if recs:
+        for c in recs:
+            d.text(c["title"])
+            d.text(c["text"])
+            d.blank()
+    else:
+        d.text("See the findings above; no specific customer recommendation was generated for this application.")
+    d.text("<<< END SHAREABLE APPLICATION REPORT <<<")
+
+
 def map_label(app: str, src: str | None) -> str:
     if not app:
         return "unmapped"
@@ -3397,8 +3538,38 @@ def sev_for(v, warn, crit):
     return "critical" if v >= crit else "warning" if v >= warn else "ok"
 
 
+def app_severity_map(R: dict) -> dict[str, str]:
+    """Worst severity per app, only for apps with CRITICAL/HIGH findings."""
+    worst = {}
+    for p in R["top"]:
+        sevs = [f["severity"] for f in p.get("findings", []) if f["severity"] in ("critical", "high")]
+        if sevs:
+            worst[p["app"]] = min(sevs, key=lambda x: SEV_ORDER[x])
+    return worst
+
+
+def build_app_reports(ctx: Ctx, R: dict) -> dict[str, "Doc"]:
+    """One standalone, shareable Doc per CRITICAL/HIGH application."""
+    R.setdefault("priority_apps", app_severity_map(R))
+    out = {}
+    for p in sorted([p for p in R["top"] if p["app"] in R["priority_apps"]],
+                    key=lambda x: SEV_ORDER[R["priority_apps"][x["app"]]]):
+        d = Doc()
+        d.highlight = {p["app"]: R["priority_apps"][p["app"]]}
+        render_app_dossier(d, R, p, ctx.args)
+        out[p["app"]] = d
+    return out
+
+
 def build_report(ctx: Ctx, R: dict) -> Doc:
     d = Doc()
+    R["priority_apps"] = app_severity_map(R)
+    for p in R["top"]:
+        sev = R["priority_apps"].get(p["app"])
+        if sev:
+            d.highlight[p["app"]] = sev
+            if p.get("domain") and "cloudwaysapps.com" not in p["domain"]:
+                d.highlight[p["domain"]] = sev
     top, h, hist = R["top"], R["health"], R["health"].get("history") or {}
     d.h1("CLOUDWAYS APPLICATION INVESTIGATION REPORT")
     # 1. Overview
@@ -3414,6 +3585,12 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
     # 1-2. Alerts first
     render_alert_section(d, R, "1. CRITICAL FINDINGS", ("critical",))
     render_alert_section(d, R, "2. HIGH-PRIORITY FINDINGS", ("high", "warning"))
+    prio = [p for p in top if p["app"] in R["priority_apps"]]
+    if prio and not ctx.args.no_app_reports:
+        d.text(f"Application reports follow for {len(prio)} CRITICAL/HIGH application(s): "
+               + ", ".join(p["app"] for p in prio) + ". Each block is self-contained and safe to share with that customer.")
+        for p in sorted(prio, key=lambda x: SEV_ORDER[R["priority_apps"][x["app"]]]):
+            render_app_dossier(d, R, p, ctx.args)
     # 3. Top apps
     d.h2(f"3. Top {len(top)} Resource-Consuming Applications")
     def pc(v):
@@ -3713,6 +3890,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--format", choices=["txt", "markdown"], default="txt", help="Report/terminal format (default txt)")
     ap.add_argument("--output-dir", default="/tmp", help="Directory for --report / --json files (default /tmp)")
     ap.add_argument("--json", action="store_true", help="Also save machine-readable JSON results")
+    ap.add_argument("--app-reports-only", action="store_true",
+                    help="Print only the shareable per-application reports for CRITICAL/HIGH applications")
+    ap.add_argument("--no-app-reports", action="store_true",
+                    help="Do not include/save the per-application reports")
     ap.add_argument("--skip-health", action="store_true", help="Skip optional server checks (Redis, Varnish, OOM, filesystems)")
     ap.add_argument("--skip-mysql", action="store_true", help="Skip MySQL/MariaDB investigation")
     ap.add_argument("--skip-history", action="store_true", help="Skip atop historical analysis")
@@ -3954,9 +4135,26 @@ def main(argv=None) -> int:
         print("Interrupted.", file=sys.stderr)
         return 130
     doc = build_report(ctx, R)
+    app_docs = build_app_reports(ctx, R)
     color = sys.stdout.isatty() and not args.no_color and args.format == "txt" and not os.environ.get("NO_COLOR")
-    sys.stdout.write(doc.render(args.format, color))
+    if args.app_reports_only:
+        if not app_docs:
+            print("No application has CRITICAL or HIGH findings - no application reports to show.")
+        for d in app_docs.values():
+            sys.stdout.write(d.render(args.format, color))
+    else:
+        sys.stdout.write(doc.render(args.format, color))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if args.report and app_docs and not args.no_app_reports:
+        ext = "md" if args.format == "markdown" else "txt"
+        for app, d in app_docs.items():
+            path = Path(args.output_dir) / f"cloudways_app_{re.sub(r'[^A-Za-z0-9_.-]', '_', app)}_{stamp}.{ext}"
+            try:
+                path.write_text(d.render(args.format, False), encoding="utf-8")
+                os.chmod(path, 0o600)
+                print(f"Application report saved: {path}")
+            except OSError as exc:
+                print(f"Could not save application report for {app}: {exc}", file=sys.stderr)
     if args.report:
         ext = "md" if args.format == "markdown" else "txt"
         path = Path(args.output_dir) / f"cloudways_app_investigation_{stamp}.{ext}"

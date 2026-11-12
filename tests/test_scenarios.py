@@ -188,6 +188,17 @@ def main() -> int:
         check("report sections in the required order", all(x >= 0 for x in pos) and pos == sorted(pos),
               [o for o, x in zip(order, pos) if x < 0] or "ok")
         check("final findings table rendered", "| Finding" in p.stdout and "Recommended action" in p.stdout)
+        p5 = subprocess.run(cmd[:2] + ["--app-reports-only"] + cmd[2:], capture_output=True, text=True, timeout=120)
+        doss = p5.stdout
+        blocks = doss.count(">>> BEGIN SHAREABLE APPLICATION REPORT >>>")
+        prio = {x["app"] for x in data["top"] if any(f["severity"] in ("critical", "high") for f in x["findings"])}
+        check("one shareable report per CRITICAL/HIGH app", blocks == len(prio) and blocks > 0, f"{blocks} blocks, {len(prio)} apps")
+        others = {x["app"] for x in data["top"]} - prio
+        check("app reports contain no other app names", not any(o in doss for o in others), sorted(o for o in others if o in doss))
+        check("app reports contain no internal recommendations or thresholds",
+              "PlatformOps" not in doss and " thresholds: " not in doss and "NOT for customer" not in doss)
+        files = sorted(x.name for x in out.glob("cloudways_app_*_*.md") if not x.name.startswith("cloudways_app_investigation"))
+        check("one saved file per priority app", len({f.split("_2")[0] for f in files}) == len(prio), files)
         check("credentials never printed", "secret" not in p.stdout and "secret" not in md)
         check("markdown report has no ANSI codes", "\x1b[" not in md)
         check("customer block present", ">>> BEGIN CUSTOMER RESPONSE >>>" in p.stdout)

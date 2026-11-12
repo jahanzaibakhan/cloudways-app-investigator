@@ -94,3 +94,12 @@ vol = {"name": "SemrushBot", "category": "seo", "requests": 6000, "pct": 8, "rpm
 assert cw.bot_level(c3, vol, {}) == "WARNING", cw.bot_level(c3, vol, {})       # volume alone -> WARNING, never HIGH
 assert any("requests/hour" in r for r in vol["reasons"]), vol["reasons"]
 print("bot-level ok")
+# --- CRITICAL/HIGH app-name highlighting: colour only in terminal, alignment preserved, no partial matches
+d = cw.Doc(); d.highlight = {"shopapp": "critical", "blogapp": "high"}
+d.table(["App", "CPU"], [["shopapp", "90%"], ["blogapp", "50%"], ["shopapp2", "1%"]])
+d.text("shopapp is slow", "critical")
+txt, plain = d.render("txt", True), d.render("txt", False)
+assert cw.ANSI_CODE_RE.sub("", txt) == plain
+assert "\x1b[1;31m\x1b[4mshopapp" in txt and "\x1b[1;38;5;208m\x1b[4mblogapp" in txt and "\x1b[4mshopapp2" not in txt
+assert "\x1b[" not in plain and "\x1b[" not in d.render("markdown", False)
+print("highlight ok")

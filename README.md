@@ -20,6 +20,9 @@ Common variants:
 ```bash
 U=https://raw.githubusercontent.com/jahanzaibakhan/cloudways-app-investigator/main/analyze_cloudways_applications.py
 
+# only the shareable reports for CRITICAL/HIGH apps, each also saved as its own file
+curl -sS "$U" | python3 - --top 5 --hour 1 --app-reports-only --report
+
 # investigate one application over the last 3 hours, sample live usage for 2 minutes
 curl -sS "$U" | python3 - --only-app abcdefghij --hour 3 --minutes 2
 
@@ -36,8 +39,11 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 
 After the **Investigation Overview** (server, window, privileges, data sources):
 
+> In the terminal, apps with CRITICAL findings are shown **red and underlined** and HIGH apps **orange and underlined** everywhere they appear, so you can follow one app through the whole report.
+
 1. **Critical Findings**
 2. **High-Priority Findings** (HIGH, plus the top WARNINGs). Each shows the application, key metrics, evidence, confidence and next action.
+   - **Shareable application report** for every CRITICAL/HIGH app: one self-contained block (and, with `--report`, one file per app) with that app's summary, findings, resources, traffic, bots, slow PHP requests, server errors, MySQL slow queries and the matching customer recommendations. It holds only that app's data and no internal notes, so it is ready to paste into the customer's ticket.
 3. **Top Resource-Consuming Applications**: CPU and memory live vs window average/peak, PHP and backend requests, busy/idle workers, profile tags
 4. **Top Bots Across the Server**: one ranking over all applications
 5. **Overall Server Health**: CPU, load, memory, swap, iowait, steal, OOM, disks, PSI, CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
@@ -61,6 +67,8 @@ The report ends with the **Final Findings Summary**: Finding / Application / Sev
 | `--only-app ID` | single application |
 | `--report --format txt\|markdown` | save ANSI-free report to `--output-dir` (default /tmp, mode 600) |
 | `--json` | machine-readable results |
+| `--app-reports-only` | print only the shareable per-application reports (CRITICAL/HIGH apps) |
+| `--no-app-reports` | leave the per-application reports out of the output and saved files |
 | `--no-color`, `--progress`, `--verbose` | output control |
 | `--skip-health`, `--skip-mysql`, `--skip-history` | skip optional collectors |
 | `--explain` | opt-in read-only `EXPLAIN` for suspected full-scan SELECTs |
@@ -243,7 +251,7 @@ What was actually run (2026-11-12):
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
 | `tests/test_exact_counts.py` (29 checks): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **29/29 pass** |
-| `tests/test_scenarios.py` (23 checks) | macOS, synthetic | **23/23 pass** |
+| `tests/test_scenarios.py` (27 checks, incl. per-app reports: one per CRITICAL/HIGH app, no other apps' data, no internal notes, one file each) | macOS, synthetic | **27/27 pass** |
 | ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
 | ↳ low-traffic / high-CPU app ranked #1, root cause = optimization | | pass |
@@ -273,7 +281,7 @@ The `tests/` folder is for development only. Servers fetch just `analyze_cloudwa
 | `tests/test_parsers_and_bots.py` | log parsers (real Cloudways line formats), SQL masking, pool includes, bot verification with a stubbed DNS resolver, bot rating |
 | `tests/test_root_cause.py` | root-cause and recommendation logic (traffic-driven + upscale, DB slowness causing FPM saturation, idle app) |
 | `tests/test_exact_counts.py` | 29 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
-| `tests/test_scenarios.py` | 23-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
+| `tests/test_scenarios.py` | 27-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
 | `tests/make_fixtures.py` | builds a small synthetic Cloudways applications root (slow plugin, busy shop, wp-login brute force) |
 
 To test changes on a real server without copying files there, push a branch and run:

@@ -2,6 +2,23 @@
 
 All notable changes to `analyze_cloudways_applications.py`. The execution command and every existing flag stay compatible across versions.
 
+## 1.4.0 - 2026-11-12
+
+### Added
+- **Priority app highlighting:** in the terminal, every mention of an app with CRITICAL findings is red and underlined, and HIGH apps are orange and underlined, in every section and table, so one app can be followed through the whole report. Table alignment is unchanged. Saved files and Markdown stay plain.
+- **Shareable application reports:** right after the alert sections, each CRITICAL/HIGH application gets one self-contained block:
+  - summary, root cause and findings with evidence
+  - resource usage
+  - traffic, with top URLs and IPs
+  - bots
+  - slow PHP requests (wall vs CPU vs wait), repeatedly slow URLs, plugins/themes from slow logs, server errors
+  - MySQL slow queries (values masked) and connections
+  - the customer recommendations that apply to that app
+
+  Each block holds only that app's data, with no other applications and no internal PlatformOps notes or thresholds. It is wrapped in `>>> BEGIN/END SHAREABLE APPLICATION REPORT` markers.
+- `--report` also saves each application report as its own file: `cloudways_app_<app>_<timestamp>.txt|md`.
+- `--app-reports-only` prints just the application reports; `--no-app-reports` turns them off.
+
 ## 1.3.0 - 2026-11-12
 
 ### Added
