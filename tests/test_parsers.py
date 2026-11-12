@@ -77,3 +77,12 @@ assert r["failed"] == 0 and r["unknown"] == 1 and not r["status"].startswith("IM
 r = v.verify("Googlebot", (".googlebot.com",), ["8.8.4.9"])
 assert r["failed"] == 1, r                                                                        # no PTR = failed
 print("dns-verify ok")
+
+# --- bot_level: shares alone must not flag a trivial-volume bot
+args.window_s = 86400
+c2 = cw.Ctx(args)
+low = {"name": "UptimeRobot", "category": "monitor", "requests": 284, "pct": 59, "rpm": 0.2, "dynamic": 284, "php_cpu_share": 80, "php_cpu_s_est": 3.0}
+assert cw.bot_level(c2, low, {}) == "NORMAL", cw.bot_level(c2, low, {})
+seo = {"name": "AhrefsBot", "category": "seo", "requests": 30000, "pct": 35, "rpm": 21, "dynamic": 29000, "php_cpu_share": 60, "php_cpu_s_est": 20000.0}
+assert cw.bot_level(c2, seo, {}) == "HIGH"
+print("bot-level ok")

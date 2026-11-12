@@ -63,6 +63,7 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 | `--no-dns-verify` | skip reverse/forward DNS verification of claimed search-engine bots |
 | `--dns-verify-max N` | max IPs DNS-verified per run (default 60) |
 | `--bot-share-high` / `--bot-share-warn` | bot share of backend requests rated HIGH / WARNING (default 25% / 10%) |
+| `--bot-min-rpm` | bots below this req/min **and** under 3% of a core of PHP CPU are never flagged, whatever their share (default 5) |
 | `--cpu-high` / `--cpu-critical` / `--mem-high` | app severity thresholds as % of server capacity / RAM (default 40 / 70 / 30) |
 | `--php-rpm-per-core-warn` | PHP requests/min per vCPU considered high volume (default 120) |
 | `--help`, `--version` | usage and version |
@@ -81,7 +82,7 @@ Each top application gets a bot table (Bot, Category, Requests, Share, /min, IPs
   5. unknown or suspicious (empty User-Agent, outdated/spoofed browser User-Agents, impersonators)
 - **Verification:** claimed Googlebot/Bingbot/Applebot/Yandex/Baidu/Petal/Seznam (and Ahrefs/Semrush) IPs are checked with reverse DNS, then forward DNS. This uses the server's own resolver, never a third-party API, and is bounded by `--dns-verify-max` and 4 s timeouts. A wrong domain, a forward mismatch or no PTR record means **impersonation**. A timeout or resolver error is *inconclusive*; it is never taken as impersonation.
 - **Cost attribution:** each bot's PHP requests and CPU are **estimated** by joining its client IPs with `php-app.access.log`. That log records the client IP and per-request CPU, but not the User-Agent.
-- **Rating:** a bot that mostly fetches static or cached files is never rated HIGH, and its finding is INFO. Verified search engines are only HIGH if they drive ≥40% of the app's PHP CPU, and the advice is to tune their crawl rate, never to block them. Named crawlers are kept out of the attack heuristics, so a busy AhrefsBot is "bot traffic", not "DDoS".
+- **Rating:** shares alone never flag a bot; it must also have real volume (≥ `--bot-min-rpm`) or real PHP cost (≥3% of a core). A bot that mostly fetches static or cached files is never rated HIGH, and its finding is INFO. Verified search engines are only HIGH if they drive ≥40% of the app's PHP CPU, and the advice is to tune their crawl rate, never to block them. Named crawlers are kept out of the attack heuristics, so a busy AhrefsBot is "bot traffic", not "DDoS".
 - **Suspicious patterns:**
   - dominant IP or /24, or high per-IP rate
   - wp-login and xmlrpc POST floods

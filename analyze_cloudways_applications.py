@@ -1367,7 +1367,7 @@ BOT_SIGNATURES = [
     (r"wget/", "wget", "automation", None),
     (r"go-http-client", "Go HTTP client", "automation", None),
     (r"okhttp|java/|apache-httpclient|jakarta", "Java/Android HTTP client", "automation", None),
-    (r"node-fetch|axios|undici|got \(", "Node.js HTTP client", "automation", None),
+    (r"node-fetch|axios|undici|got \(|\bnode/\d", "Node.js HTTP client", "automation", None),
     (r"guzzlehttp|php/\d", "PHP HTTP client", "automation", None),
     (r"libwww-perl|lwp::", "Perl script", "automation", None),
     (r"masscan|zgrab|nmap|nikto|sqlmap|wpscan|nuclei|censysinspect|expanse|internet-measurement|paloalto", "Vulnerability scanner", "automation", None),
@@ -2300,12 +2300,17 @@ def bot_level(ctx: Ctx, b: dict, t: dict) -> str:
     if b["requests"] < 200:
         return "NORMAL"
     share, cpu = b["pct"], b.get("php_cpu_share", 0.0)
+    # Absolute load: a large *share* of a nearly idle app is irrelevant.
+    core_pct = b.get("php_cpu_s_est", 0.0) / max(getattr(a, "window_s", 3600), 1) * 100.0
+    busy_rate = b["rpm"] >= a.bot_min_rpm
     if b["category"] == "monitor" or b["name"].startswith("WordPress loopback"):
-        return "WARNING" if share >= 50 else "NORMAL"
+        return "WARNING" if b["rpm"] >= 30 or core_pct >= 10 else "NORMAL"
+    if not busy_rate and core_pct < 3:
+        return "NORMAL"
     if b.get("category_label") == "Search engine (verified)":
-        return "HIGH" if cpu >= 40 else "WARNING" if (share >= 40 or cpu >= 20) else "NORMAL"
+        return "HIGH" if cpu >= 40 and core_pct >= 10 else "WARNING" if (share >= 40 or cpu >= 20) else "NORMAL"
     mostly_static = pct(b["dynamic"], b["requests"]) < 20 and cpu < 10
-    if share >= a.bot_share_high or cpu >= 25:
+    if (share >= a.bot_share_high or cpu >= 25) and (core_pct >= 3 or busy_rate):
         return "WARNING" if mostly_static and not b.get("impersonation") else "HIGH"
     if share >= a.bot_share_warn or cpu >= 10 or b.get("impersonation"):
         return "WARNING"
@@ -3502,6 +3507,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dns-verify-max", type=int, default=60, help="Max IPs to DNS-verify per run (default 60)")
     ap.add_argument("--bot-share-high", type=float, default=25, help="Bot share of backend requests flagged HIGH (default 25%%)")
     ap.add_argument("--bot-share-warn", type=float, default=10, help="Bot share flagged WARNING (default 10%%)")
+    ap.add_argument("--bot-min-rpm", type=float, default=5,
+                    help="Bots below this req/min and <3%% of a core PHP CPU are never flagged (default 5)")
     ap.add_argument("--chrome-latest-major", type=int, default=0)
     ap.add_argument("--chrome-obsolete-margin", type=int, default=40)
     ap.add_argument("--no-ip-lookup", action="store_true", help=argparse.SUPPRESS)   # compat: this tool never sends IPs out
