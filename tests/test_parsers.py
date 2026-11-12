@@ -1,4 +1,4 @@
-import sys, importlib.util, tempfile, os, gzip
+import importlib.util, tempfile, os
 from pathlib import Path
 from datetime import datetime
 spec = importlib.util.spec_from_file_location("cw", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analyze_cloudways_applications.py"))

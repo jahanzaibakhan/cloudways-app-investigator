@@ -1,4 +1,4 @@
-import random, os, sys
+import random, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 root = Path(sys.argv[1] if len(sys.argv) > 1 else "fixture") / "applications"; random.seed(1)

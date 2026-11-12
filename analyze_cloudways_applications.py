@@ -516,12 +516,12 @@ def _parse_fpm_conf(path: Path, current: dict | None, pools: dict, depth: int = 
 def collect_pools(ctx: Ctx, apps: dict) -> dict[str, dict]:
     """Return pool_name -> config, with `app` and `php_version` resolved."""
     pools: dict[str, dict] = {}
-    for conf in sorted(glob.glob("/etc/php/*/fpm/pool.d/*.conf")) + sorted(glob.glob("/etc/php-fpm.d/*.conf")):
+    for conf in [c for g in ctx.args.pool_conf_glob.split(",") for c in sorted(glob.glob(g.strip()))]:
         if conf.endswith("placeholder.conf"):
             continue
         before = set(pools)
         _parse_fpm_conf(Path(conf), None, pools)
-        m = re.search(r"/etc/php/([\d.]+)/", conf)
+        m = re.search(r"/php/([\d.]+)/", conf)
         for name in set(pools) - before:
             pools[name]["php_version"] = m.group(1) if m else ""
     user_to_app = {}
@@ -722,6 +722,8 @@ def sample_resources(ctx: Ctx, apps: dict, seconds: float, interval: float, hook
     prev_disk, prev_net, prev_t = read_diskstats(), read_netdev(), time.time()
     first_t = prev_t
     first_ticks: dict[str, tuple[int, int]] = {}
+    busy_streak: dict[str, int] = {}
+    busy_best: dict[str, tuple[int, tuple]] = {}      # pid -> (max consecutive busy samples, owner key)
     for i in range(nsamples):
         t = time.time()
         snap = {}
@@ -754,8 +756,14 @@ def sample_resources(ctx: Ctx, apps: dict, seconds: float, interval: float, hook
                 elif start / CLK_TCK + btime >= first_t - 1:
                     delta = ticks          # process born during sampling
                 owners_cpu[key] += delta
-            if detail.startswith("fpm:") and (state in ("R", "D") or delta > 0):
-                owners_busy[key] += 1
+            if detail.startswith("fpm:"):
+                if state in ("R", "D") or delta > 0:
+                    owners_busy[key] += 1
+                    busy_streak[pid] = busy_streak.get(pid, 0) + 1
+                    if busy_streak[pid] > busy_best.get(pid, (0,))[0]:
+                        busy_best[pid] = (busy_streak[pid], key)
+                elif i:
+                    busy_streak[pid] = 0
             if i == 0:
                 per_owner[key]["kinds"][detail] += 1
             if i == 0:
@@ -828,15 +836,29 @@ def sample_resources(ctx: Ctx, apps: dict, seconds: float, interval: float, hook
     # PSS (proportional set size) avoids double counting shared pages between FPM workers.
     pss = Counter()
     pss_ok = False
+    top_procs = defaultdict(list)
     for pid, (comm, state, ppid, ticks, start, rss, uid, cmd) in last_snapshot.items():
         if ppid == 2:
             continue
         v = read_pss_kb(int(pid))
-        if v is None:
-            continue
-        pss_ok = True
-        kind, owner, _ = classify_process(comm, cmd, uid, ctx, apps)
-        pss[(kind, owner)] += v
+        kind, owner, detail = classify_process(comm, cmd, uid, ctx, apps)
+        if v is not None:
+            pss_ok = True
+            pss[(kind, owner)] += v
+        if kind == "app":
+            ft = first_ticks.get(pid)
+            span = max(elapsed, 0.001)
+            age = (time.time() - (start / CLK_TCK + btime)) if btime else 0
+            cpu_now = ((ticks - ft[0]) / CLK_TCK / span * 100.0) if ft and ft[1] == start else \
+                (ticks / CLK_TCK / max(age, span) * 100.0)
+            top_procs[(kind, owner)].append({"pid": int(pid), "what": detail, "state": state, "cpu": round(cpu_now, 1),
+                                             "mem_mb": round((v if v is not None else rss) / 1024.0, 1),
+                                             "mem_kind": "PSS" if v is not None else "RSS", "age_s": int(age)})
+    long_busy = defaultdict(list)
+    min_streak = max(3, int(ctx.args.long_request_seconds / max(interval, 0.5)))
+    for pid, (n, key) in busy_best.items():
+        if n >= min_streak:
+            long_busy[key].append({"pid": int(pid), "busy_s": round(n * interval)})
     if not pss_ok:
         ctx.note("PSS (smaps_rollup) not readable - memory per app uses RSS, which over-counts memory shared between PHP-FPM workers. Run as root for PSS.")
 
@@ -855,6 +877,10 @@ def sample_resources(ctx: Ctx, apps: dict, seconds: float, interval: float, hook
             "busy_avg": sum(o["busy_series"]) / len(o["busy_series"]) if o["busy_series"] else 0,
             "busy_peak": max(o["busy_series"]) if o["busy_series"] else 0,
             "kinds": dict(o["kinds"]), "long_cli": sorted(o["long_cli"], key=lambda x: -x["live_cpu"])[:5],
+            "procs_last": o["procs_series"][-1] if o["procs_series"] else 0,
+            "busy_last": o["busy_series"][-1] if o["busy_series"] else 0,
+            "top_procs": sorted(top_procs.get(key, []), key=lambda x: (-x["cpu"], -x["mem_mb"]))[:8],
+            "long_busy": sorted(long_busy.get(key, []), key=lambda x: -x["busy_s"])[:5],
         }
     return {"elapsed": elapsed, "samples": nsamples, "owners": owners, "server": server, "pss_ok": pss_ok}
 
@@ -1851,6 +1877,9 @@ def build_profiles(ctx: Ctx, apps: dict, sample: dict, history: dict | None, fpm
             "mem_pct": pct(mem_basis, mem_total_mb),
             "procs_peak": lv.get("procs_peak", 0), "busy_peak": lv.get("busy_peak", 0), "busy_avg": lv.get("busy_avg", 0),
             "proc_kinds": lv.get("kinds", {}), "long_cli": lv.get("long_cli", []),
+            "top_procs": lv.get("top_procs", []), "long_busy": lv.get("long_busy", []), "busy_last": lv.get("busy_last", 0),
+            "fpm_procs_last": sum(v for k, v in lv.get("kinds", {}).items() if k.startswith("fpm:")),
+            "fpm_pss_mb": sum(x["mem_mb"] for x in lv.get("top_procs", []) if x["what"].startswith("fpm:")),
             "php_requests": fq.get("requests", 0), "php_cpu_s": fq.get("cpu_s", 0.0),
             "php_req_share": pct(fq.get("requests", 0), total_php), "php_cpu_share": pct(fq.get("cpu_s", 0), total_php_cpu),
             "cpu_ms_per_req": fq.get("cpu_ms_per_req"),
@@ -1887,9 +1916,61 @@ def resource_tags(p: dict, ctx: Ctx) -> list[str]:
 CONF_ORDER = {"Confirmed": 0, "Likely": 1, "Suspected": 2, "Inconclusive": 3}
 
 
-def F(area, severity, confidence, text, evidence=None, scenario=None):
+# (substring of finding text, recommended next action). First match wins.
+NEXT_ACTIONS = [
+    ("Application is a top consumer", "Confirm with the per-app process list and the CPU source shown; compare against the window average before acting."),
+    ("proportional to legitimate PHP traffic", "Check whether resource pressure is sustained (atop history); if so evaluate upscaling, otherwise monitor peak hours."),
+    ("disproportionate to traffic", "Profile the top CPU paths (New Relic/Xdebug/Query Monitor); review plugins, theme and custom code on those URLs."),
+    ("non-web processes", "Identify the job from the command line; review its schedule and runtime with the application owner."),
+    ("Background processes owned", "Identify the process from its command line and confirm with the customer whether it is expected."),
+    ("high lifetime CPU", "Re-check during the customer's busy period; no action if it stays idle."),
+    ("Slow WP-Cron", "Review the listed hooks (WP Crontrol) and their schedule; move heavy hooks to off-peak."),
+    ("bot / application-layer attack", "Review the listed IPs/UAs/URLs manually; if abusive, apply Cloudflare/WAF rate limits or targeted blocks."),
+    ("Isolated traffic anomaly", "No action on its own; re-check if it recurs alongside resource pressure."),
+    ("worker exhaustion", "Find what keeps workers busy (slow paths, slow queries, external calls) before raising pm.max_children; check RAM headroom."),
+    ("queued waiting for a free PHP-FPM worker", "Treat as worker saturation: reduce PHP execution time first; raise max_children only if RAM allows."),
+    ("All PHP-FPM workers were busy", "Re-sample for longer (--minutes) and check max_children warnings in the FPM log."),
+    ("concurrency reached pm.max_children", "Verify with a longer live sample; check for max_children warnings."),
+    ("Long-running PHP requests", "Match the busy workers with slow-log traces and slow paths; check external API calls and DB waits."),
+    ("terminated by request_terminate_timeout", "Review the listed scripts; they exceed the execution limit and fail for visitors."),
+    ("Slow PHP execution", "Profile the slowest paths listed; check slow-log traces and slow queries for the same window."),
+    ("slow-log traces", "Review the plugin/function in the trace (often external HTTP calls or heavy loops) with the developer."),
+    ("High memory per PHP request", "Find the memory-heavy URLs listed; check memory_limit and per-worker RAM x max_children."),
+    ("Recurring slow database queries", "Review the query fingerprints with the developer: indexes, autoload options, object cache (Redis)."),
+    ("mysqldump/backup", "No app action; consider moving backup windows away from peak traffic."),
+    ("full table scan", "Add an appropriate index or rewrite the query (developer)."),
+    ("Possible missing index", "Run EXPLAIN on the query (--explain) to confirm before recommending an index."),
+    ("concurrently running queries", "Inspect SHOW FULL PROCESSLIST during the peak; look for lock waits and slow fingerprints."),
+    ("Long-running query", "Check whether it is expected (report/backup) or blocking others; do not kill without customer approval."),
+    ("Elevated 5xx", "Check the app error log and PHP-FPM log for the 5xx timestamps."),
+    ("OOM-killer", "Review memory sizing: max_children x per-request memory, MySQL buffer pool, Redis maxmemory; consider more RAM."),
+    ("Sustained high server CPU", "Identify the top consumer above; if it is traffic-driven and legitimate, evaluate upscaling."),
+    ("High CPU during live sampling", "Re-run with --minutes 10+ or review atop to confirm whether it is sustained."),
+    ("Memory pressure", "Reduce memory footprint (FPM max_children, MySQL buffers, Redis) or upscale RAM."),
+    ("Heavy swap", "Find the processes in swap; swap activity slows PHP and MySQL - reduce memory pressure."),
+    ("CPU steal", "Check hypervisor/provider health; consider migrating the server if steal persists."),
+    ("High I/O wait", "Use atop -d / iostat to find the I/O source (MySQL tmp tables, backups, logs)."),
+    ("nearly full", "Free space (logs, backups, local backups) or expand the disk."),
+    ("Shared service", "Review that service's configuration and usage; it affects every application on the server."),
+    ("Redis has evicted", "Raise maxmemory or reduce cached data; evictions lower cache hit ratio."),
+    ("near max_connections", "Find the databases holding connections; check for connection leaks or slow queries."),
+    ("waiting on row locks", "Inspect INNODB_TRX for the blocking transaction."),
+    ("InnoDB deadlock", "Review the listed tables' write patterns with the developer if deadlocks recur."),
+    ("on-disk temporary tables", "Review queries with GROUP BY/ORDER BY on large sets; consider tmp_table_size if justified."),
+    ("High CPU but no PHP-FPM access log", "Enable/check php-app.access.log, or rely on atop history for attribution."),
+]
+
+
+def next_action_for(text: str) -> str:
+    for key, act in NEXT_ACTIONS:
+        if key.lower() in text.lower():
+            return act
+    return ""
+
+
+def F(area, severity, confidence, text, evidence=None, scenario=None, action=None):
     return {"area": area, "severity": severity, "confidence": confidence, "text": text,
-            "evidence": evidence or [], "scenario": scenario}
+            "evidence": evidence or [], "scenario": scenario, "action": action or next_action_for(text)}
 
 
 def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
@@ -1983,6 +2064,12 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
     elif mc and fa.get("peak_concurrency", 0) >= mc and not hits:
         fnd.append(F("php-fpm", "warning", "Suspected", "Estimated PHP concurrency reached pm.max_children",
                      [f"Estimated peak concurrency {fa['peak_concurrency']} (from request start+duration, 1s resolution) vs limit {mc}"]))
+    if p.get("long_busy"):
+        lb = p["long_busy"]
+        fnd.append(F("php-fpm", "warning", "Likely", "Long-running PHP requests observed live (worker busy continuously)",
+                     [f"PID {x['pid']} busy for ~{x['busy_s']}s of the {a.sample_seconds:.0f}s sample" for x in lb[:3]]
+                     + (["Slowest logged paths: " + ", ".join(f"{r[6]} ({r[3]}s)" for r in fa.get("slowest_requests", [])[:2])]
+                        if fa.get("slowest_requests") else []), scenario="optimization"))
     if p.get("fpm_timeouts"):
         fnd.append(F("php-fpm", "critical", "Confirmed", "PHP requests were terminated by request_terminate_timeout",
                      [f"{p['fpm_timeouts']} timeouts; scripts: " + ", ".join(f"{s} ({c})" for s, c in p["fpm_timeout_scripts"][:3])],
@@ -2180,6 +2267,46 @@ def server_findings(ctx: Ctx, h: dict, services: dict, oom: dict, mysql: dict, r
             out.append(F("mysql", "info", "Confirmed", "Frequent on-disk temporary tables",
                          [f"{r['Created_tmp_disk_tables']:.1f}/s during sampling (tmp_table_size={v.get('tmp_table_size', '?')})"]))
     return out
+
+
+def issue_origin(ctx: Ctx, h: dict, attribution: list, srv_findings: list, top: list) -> dict:
+    """Where does pressure come from: applications, shared services, other processes, or the infrastructure?"""
+    hist = h.get("history") or {}
+    cpu_busy = (hist.get("cpu_busy") or (None,))[0]
+    cpu_busy = cpu_busy if cpu_busy is not None else h.get("cpu_busy", 0)
+    mem_used = h.get("mem_used_pct", 0)
+    oom = any("OOM" in f["text"] for f in srv_findings)
+    steal = max(h.get("steal", 0), (hist.get("steal") or (0, 0))[0] or 0)
+    iowait = max(h.get("iowait", 0), (hist.get("iowait") or (0, 0))[0] or 0)
+    groups = {"applications": [0.0, 0.0], "shared services": [0.0, 0.0], "other processes": [0.0, 0.0]}
+    for name, v in attribution:
+        g = "applications" if name.startswith(("app:", "other apps")) else \
+            "other processes" if name.startswith(("other", "system/other")) else "shared services"
+        groups[g][0] += v["cpu"]
+        groups[g][1] += v["mem_mb"]
+    ev = [f"{g}: CPU {c:.0f}% of one core, memory {fmt_mb(m)}" for g, (c, m) in groups.items()]
+    ev.append(f"server CPU busy {cpu_busy:.0f}% ({'atop window avg' if hist else 'live'}), memory {mem_used:.0f}%, "
+              f"steal {steal:.1f}%, iowait {iowait:.1f}%")
+    infra = []
+    if steal >= ctx.args.steal_threshold:
+        infra.append(f"CPU steal {steal:.1f}% (hypervisor contention)")
+    if iowait >= 15:
+        infra.append(f"I/O wait {iowait:.1f}% (disk bottleneck)")
+    pressure = cpu_busy >= 70 or mem_used >= 85 or oom
+    if infra:
+        return {"origin": "infrastructure", "confidence": "Likely", "evidence": infra + ev,
+                "text": "Underlying server/infrastructure limitation: " + "; ".join(infra)}
+    if not pressure:
+        return {"origin": "none", "confidence": "Confirmed", "evidence": ev,
+                "text": "No server-level resource pressure during the investigation window"}
+    cpu_lead = max(groups.items(), key=lambda kv: kv[1][0])
+    mem_lead = max(groups.items(), key=lambda kv: kv[1][1])
+    lead = mem_lead if (mem_used >= 85 or oom) and cpu_busy < 70 else cpu_lead
+    names = ", ".join(p["app"] for p in top if p["tags"] != ["Normal"]) or "see top applications"
+    text = {"applications": f"Application workload (top: {names})",
+            "shared services": "Shared services (MySQL/Redis/Varnish/Elasticsearch...) rather than a single application",
+            "other processes": "Non-application processes (system, security scanners, backups or other daemons)"}[lead[0]]
+    return {"origin": lead[0], "confidence": "Likely", "evidence": ev, "text": text}
 
 
 def recommendations(ctx: Ctx, profiles: list[dict], srv_findings: list[dict], h: dict) -> tuple[list[dict], list[dict]]:
@@ -2399,6 +2526,12 @@ def render_table(headers, rows, align=None, maxw=None, color=False) -> list[str]
     return [sep, head, sep] + [line(r) for r in rows] + [sep] if rows else ["  (no data)"]
 
 
+def map_label(app: str, src: str | None) -> str:
+    if not app:
+        return "unmapped"
+    return f"{app} ({'naming' if src and src.startswith('naming') else 'config'})"
+
+
 def sev_for(v, warn, crit):
     if v is None:
         return None
@@ -2446,6 +2579,10 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
             for name, s in R["attribution"]]
     d.table(["Consumer", "CPU core%", "Server%", "Memory", "RAM%"], attr[:12])
     d.text("Shared services (MySQL, Redis, Varnish, ...) are shown separately and are NOT attributed to applications.")
+    o = R["origin"]
+    d.kv([("Issue origin", o["text"], "ok" if o["origin"] == "none" else "warning"), ("Confidence", o["confidence"])])
+    for e in o["evidence"]:
+        d.bullet(e, None, 1)
     if R.get("redis") and "used_mb" in R["redis"]:
         r = R["redis"]
         d.bullet(f"Redis: used {fmt_mb(r['used_mb'])} (RSS {fmt_mb(r['rss_mb'])}), maxmemory {fmt_mb(r['maxmemory_mb']) if r['maxmemory_mb'] else 'unlimited'}, "
@@ -2454,16 +2591,29 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
         d.bullet(f"Varnish: hit ratio {R['varnish']['hit_ratio']:.0f}% since service start, LRU nuked {R['varnish']['lru_nuked']:,}")
     for f in R["server_findings"]:
         d.bullet(f"{f['text']} ({f['confidence']}): " + "; ".join(f["evidence"][:2]), f["severity"])
+        if f.get("action"):
+            d.bullet("Next action: " + f["action"], None, 1)
     # 3. Top apps
     d.h2(f"3. Top {len(top)} Resource-Consuming Applications")
-    d.table(["#", "Application", "CPU core%", "Srv%", "Memory", "PHP req", "Backend req", "Workers", "Profile"],
-            [[i, f"{p['app']}", f"{p['cpu_sustained']:.0f}%", f"{p['cpu_server_share']:.0f}%", fmt_mb(p["mem_mb"]),
-              fmt_num(p["php_requests"]), fmt_num((p.get("traffic") or {}).get("total")), f"{p['busy_peak']}/{p.get('max_children') or '?'}",
-              ", ".join(p["tags"])] for i, p in enumerate(top, 1)],
+    def pc(v):
+        return f"{v:.0f}%" if v is not None else "n/a"
+    d.text("CPU and memory - LIVE (instantaneous, during sampling) vs WINDOW (historical average over the log window):")
+    d.table(["#", "Application", "CPU live", "CPU live pk", "CPU window", "CPU win pk", "Srv%", "Mem live", "Mem window"],
+            [[i, p["app"], pc(p.get("cpu_live_avg")), pc(p.get("cpu_live_peak")),
+              pc(p["cpu_hist_avg"] if p.get("cpu_hist_avg") is not None else p.get("cpu_fpm_pct")),
+              pc(p.get("cpu_hist_peak")), f"{p['cpu_server_share']:.0f}%",
+              f"{fmt_mb(p['mem_mb'])} {p['mem_kind']}", fmt_mb(p.get("mem_hist_avg")) + (" RSS" if p.get("mem_hist_avg") else "")]
+             for i, p in enumerate(top, 1)],
+            align=["r", "l", "r", "r", "r", "r", "r", "r", "r"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 0])
+    d.text("CPU in % of one vCPU core. Srv% = sustained CPU as share of total server capacity (used for ranking).")
+    d.table(["#", "Application", "PHP req", "Backend req", "FPM procs", "Busy pk", "Idle", "max_children", "Profile"],
+            [[i, p["app"], fmt_num(p["php_requests"]), fmt_num((p.get("traffic") or {}).get("total")),
+              p.get("fpm_procs_last", 0), p["busy_peak"], max(0, p.get("fpm_procs_last", 0) - p.get("busy_last", 0)),
+              p.get("max_children") or "?", ", ".join(p["tags"])] for i, p in enumerate(top, 1)],
             align=["r", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 30])
-    d.text("Workers = peak busy / pm.max_children. CPU core% = sustained average over the window (source per app below).")
     for p in top:
-        d.bullet(f"{p['app']}: {p['domain'] or 'domain n/a'} [{p['type']}] DB '{p['db']}' | CPU source: {p['cpu_source']}"
+        d.bullet(f"{p['app']}: {p['domain'] or 'domain n/a'} [{p['type']}] path {p['app_dir']} | DB '{p['db']}' "
+                 f"(mapping: {p['db_source']}) | CPU source: {p['cpu_source']}"
                  + (f" | live {p['cpu_live_avg']:.0f}%/peak {p['cpu_live_peak']:.0f}%" if p.get("cpu_live_avg") is not None else "")
                  + (f" | history peak {p['cpu_hist_peak']:.0f}% at {p['cpu_hist_peak_at']}" if p.get("cpu_hist_peak") is not None else "")
                  + f" | memory {p['mem_kind']}" + (f", history avg {fmt_mb(p['mem_hist_avg'])} RSS" if p.get("mem_hist_avg") else ""))
@@ -2513,7 +2663,8 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
                               f"max_requests={pool.get('pm.max_requests', '?')}"),
               ("Timeouts", f"request_terminate_timeout={pool.get('request_terminate_timeout', 'unset')} "
                            f"slowlog_timeout={pool.get('request_slowlog_timeout', 'unset')}"),
-              ("Workers (live)", f"{p['procs_peak']} processes peak, busy avg {p['busy_avg']:.1f} / peak {p['busy_peak']} (estimated from R/D state + CPU activity)",
+              ("Workers (live)", f"{p.get('fpm_procs_last', 0)} FPM workers now; busy avg {p['busy_avg']:.1f} / peak {p['busy_peak']}; "
+                                 f"idle now {max(0, p.get('fpm_procs_last', 0) - p.get('busy_last', 0))} (busy = R/D state or CPU activity, estimated)",
                sev_for(p["busy_peak"] / mc if mc else None, 0.7, 1.0)),
               ("Listen queue (live)", f"peak {p.get('listen_queue_peak', 0)}" if p.get("listen_queue_measured") else "not measured (ss unavailable)",
                "critical" if p.get("listen_queue_peak") else "ok" if p.get("listen_queue_measured") else None),
@@ -2527,6 +2678,14 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
               ("Peak concurrency", (f"{fa['peak_concurrency']} busy workers at {fa.get('peak_concurrency_at', '-')} UTC "
                                     "(estimated: busy worker-seconds in the busiest second)") if fa.get("peak_concurrency") is not None else "n/a"),
               ("Slow-log traces", f"{sl.get('entries', 0)}" + (" (log unreadable)" if sl.get("unreadable") else ""))])
+        if p.get("top_procs"):
+            d.table(["PID", "Process", "State", "CPU now", "Memory", "Age"],
+                    [[x["pid"], x["what"], x["state"], f"{x['cpu']:.0f}%", f"{fmt_mb(x['mem_mb'])} {x['mem_kind']}",
+                      f"{x['age_s'] // 86400}d" if x["age_s"] >= 86400 else f"{x['age_s'] // 60}m"] for x in p["top_procs"][:6]],
+                    align=["r", "l", "l", "r", "r", "r"], maxw=[0, 34, 0, 0, 0, 0])
+            if p["fpm_procs_last"]:
+                d.text(f"PHP-FPM workers: {p['fpm_procs_last']} now, avg {fmt_mb(p['fpm_pss_mb'] / max(1, min(len(p['top_procs']), p['fpm_procs_last'])))} "
+                       f"per listed worker. CPU now = average over the live sample.")
         if fa.get("top_paths_cpu"):
             d.table(["Path (by CPU)", "Hits", "CPU s", "Avg s", "Max s", "Max MB"],
                     [[x["path"], x["hits"], x["cpu_s"], x["avg_s"], x["max_s"], x["max_mb"]] for x in fa["top_paths_cpu"][:6]], maxw=[46, 0, 0, 0, 0, 0])
@@ -2555,8 +2714,8 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
               ("Slow queries (window)", f"{R['mysql_slow'].get('total', 0):,} ({R['mysql_slow'].get('dump_queries', 0)} backup/dump)")])
         bydb = R["mysql_slow"].get("by_db", {})
         if bydb:
-            d.table(["Database", "Application", "Slow q", "Total s", "Max s"],
-                    [[db, x["app"] or "-", x["count"], f"{x['time']:.0f}", f"{x['max']:.1f}"] for db, x in list(bydb.items())[:8]])
+            d.table(["Database", "Application (mapping)", "Slow q", "Total s", "Max s"],
+                    [[db, map_label(x["app"], R["db_map_src"].get(db)), x["count"], f"{x['time']:.0f}", f"{x['max']:.1f}"] for db, x in list(bydb.items())[:8]])
         fps = R["mysql_slow"].get("fingerprints", [])
         if fps:
             d.table(["DB", "Count", "Total s", "Max s", "Rows exam.", "Query fingerprint (literals masked)"],
@@ -2564,8 +2723,8 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
                       ("[dump] " if x["dump"] else "") + x["fingerprint"]] for x in fps[:8]], maxw=[12, 0, 0, 0, 0, 52])
         per_db = m.get("per_db", {})
         if per_db:
-            d.table(["Database", "Application", "Conn avg/peak", "Running avg/peak"],
-                    [[db, x["app"] or "-", f"{x['conn_avg']:.1f}/{x['conn_peak']}", f"{x['running_avg']:.1f}/{x['running_peak']}"]
+            d.table(["Database", "Application (mapping)", "Conn avg/peak", "Running avg/peak"],
+                    [[db, map_label(x["app"], R["db_map_src"].get(db)), f"{x['conn_avg']:.1f}/{x['conn_peak']}", f"{x['running_avg']:.1f}/{x['running_peak']}"]
                      for db, x in sorted(per_db.items(), key=lambda kv: -kv[1]["running_peak"])[:8]])
         for q in m.get("long_running", [])[:5]:
             d.bullet(f"[{q['db']}] {q['time_s']}s {q['state']}: {q['query']}", "info" if q["dump"] else "warning")
@@ -2579,6 +2738,8 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
             d.bullet(f"{f['text']} [{f['confidence']}]", f["severity"])
             for e in f["evidence"][:4]:
                 d.bullet(e, None, 1)
+            if f.get("action"):
+                d.bullet("Next action: " + f["action"], None, 1)
     # 8. RCA
     d.h2("8. Root Cause Analysis")
     for p in top:
@@ -2631,6 +2792,8 @@ def build_report_part2(ctx: Ctx, R: dict, d: Doc) -> Doc:
     for i, p in enumerate(top, 1):
         d.text(f"{i}. {p['app']}: {p['root_cause']['text']} [{p['root_cause']['confidence']}]")
         d.text("   " + p["summary"][0])
+    d.bullet(f"Issue origin: {R['origin']['text']} [{R['origin']['confidence']}]",
+             "ok" if R["origin"]["origin"] == "none" else "warning")
     crit = [f for f in R["server_findings"] if f["severity"] == "critical"]
     d.bullet("Server: " + ("; ".join(f["text"] for f in crit) if crit else "no critical server-level condition detected"),
              "critical" if crit else "ok")
@@ -2679,6 +2842,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip-history", action="store_true", help="Skip atop historical analysis")
     ap.add_argument("--explain", action="store_true", help="Run EXPLAIN (read-only) for top suspected full-scan SELECTs")
     ap.add_argument("--fpm-log-glob", default="/var/log/php*-fpm.log*")
+    ap.add_argument("--pool-conf-glob", default="/etc/php/*/fpm/pool.d/*.conf,/etc/php-fpm.d/*.conf",
+                    help="Comma-separated globs of PHP-FPM pool configs")
     ap.add_argument("--atop-timeout", type=float, default=90)
     ap.add_argument("--cpu-threshold", type=float, default=20, help="High CPU = this %% of server capacity (default 20)")
     ap.add_argument("--mem-threshold", type=float, default=15, help="High memory = this %% of RAM (default 15)")
@@ -2687,6 +2852,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--slow-query-min", type=int, default=10, help="Min slow queries per DB to flag (default 10)")
     ap.add_argument("--long-query-seconds", type=int, default=10, help="Running query considered long (default 10s)")
     ap.add_argument("--steal-threshold", type=float, default=8)
+    ap.add_argument("--long-request-seconds", type=float, default=10,
+                    help="Live: FPM worker busy continuously this long = long-running request (default 10)")
     ap.add_argument("--bg-cpu-threshold", type=float, default=10, help="Background process CPU %% of one core to flag (default 10)")
     ap.add_argument("--chrome-latest-major", type=int, default=0)
     ap.add_argument("--chrome-obsolete-margin", type=int, default=40)
@@ -2737,11 +2904,15 @@ def investigate(args) -> tuple[Ctx, dict]:
     ctx.pools = collect_pools(ctx, apps)
     if not ctx.pools:
         ctx.note("No PHP-FPM pool configs readable under /etc/php/*/fpm/pool.d - pool limits unknown.")
-    db_to_app = {}
+    db_to_app, db_map_src = {}, {}
     for name, ap in apps.items():
-        db_to_app.setdefault(name, name)
         if ap.get("db_name"):
             db_to_app[ap["db_name"]] = name
+            db_map_src[ap["db_name"]] = ap["db_source"]
+    for name in apps:
+        if name not in db_to_app:
+            db_to_app[name] = name
+            db_map_src[name] = "naming convention (db = app id)"
     scope = {args.only_app: apps[args.only_app]} if args.only_app and args.only_app in apps else apps
     if args.only_app and args.only_app not in apps:
         raise SystemExit(f"Application '{args.only_app}' not found. Available: {', '.join(sorted(apps))}")
@@ -2842,7 +3013,8 @@ def investigate(args) -> tuple[Ctx, dict]:
         p["summary"] = two_line_summary(p, short_window)
     internal, customer = recommendations(ctx, top, srv_find, health)
     host, ip = server_identity()
-    R = {"hostname": host, "server_ip": ip, "generated": now.strftime("%Y-%m-%d %H:%M:%S"), "window_desc": window_desc,
+    origin = issue_origin(ctx, health, attribution, srv_find, top)
+    R = {"origin": origin, "db_map_src": db_map_src, "hostname": host, "server_ip": ip, "generated": now.strftime("%Y-%m-%d %H:%M:%S"), "window_desc": window_desc,
          "sample": sample, "app_count": len(scope), "top": top, "health": health, "attribution": attribution,
          "mysql": mres, "mysql_slow": mslow, "oom": oom, "redis": redis, "varnish": varnish,
          "server_findings": srv_find, "internal": internal, "customer": customer}
@@ -2878,7 +3050,7 @@ def main(argv=None) -> int:
         try:
             path.write_text(doc.render(args.format, False), encoding="utf-8")
             os.chmod(path, 0o600)
-            print(f"\nReport saved: {path}", file=sys.stderr)
+            print(f"\nReport saved: {path}")
         except OSError as exc:
             print(f"Could not save report: {exc}", file=sys.stderr)
     if args.json:
@@ -2889,7 +3061,7 @@ def main(argv=None) -> int:
         try:
             path.write_text(json.dumps(json_safe(R2), indent=1, default=str), encoding="utf-8")
             os.chmod(path, 0o600)
-            print(f"JSON saved: {path}", file=sys.stderr)
+            print(f"JSON saved: {path}")
         except OSError as exc:
             print(f"Could not save JSON: {exc}", file=sys.stderr)
     return 0
