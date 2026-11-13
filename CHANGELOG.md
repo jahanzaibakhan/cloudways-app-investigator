@@ -2,6 +2,27 @@
 
 All notable changes to `analyze_cloudways_applications.py`. The execution command and every existing flag stay compatible across versions.
 
+## 1.7.0 - 2026-11-13
+
+### Changed
+- **Application reports present findings as paragraphs**, not bullet lists:
+  - an "Overall" line with the counts per severity
+  - **"What is happening"**: impact, i.e. server errors, OOM kills, PHP worker limit and queue, timeouts, slow pages, CPU/memory use
+  - **"Why"**: causes, i.e. the heaviest URL, CPU per request, plugins/themes in slow-log traces, slow database queries, DB connections, bots, abusive traffic, long-running requests, background processes
+
+  Each sentence is built from the measured values and only appears when the matching finding exists, so the text is ready to paste into a ticket.
+
+### Added
+- **Alarming values in red** (terminal) and **bold** (Markdown); plain in saved `.txt` files. In the app report this covers:
+  - the #1 most requested URL and the #1 visitor IP, always
+  - any URL above 20% of traffic, any IP above 10% or belonging to a flagged bot
+  - 5xx status codes above 5%, HIGH bots and the top IP of each, impersonators
+  - request durations at/above the slow threshold, HIGH-MEM requests, 5xx responses
+  - the top repeated slow URL and the top slow-query pattern, queries averaging ≥10 s or peaking ≥30 s, more than 300 s of slow queries in total
+  - every key number in the paragraphs
+
+  Table alignment is unchanged.
+
 ## 1.6.0 - 2026-11-13
 
 ### Changed

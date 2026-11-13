@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -3240,6 +3240,56 @@ def set_width(args) -> int:
 
 
 ANSI_CODE_RE = re.compile(r"\x1b\[[0-9;]*m")
+MK_ON, MK_OFF = "\x01", "\x02"          # invisible "alarming value" markers inside report text
+
+
+def alarm(v) -> str:
+    """Mark a value as alarming: red in the terminal, **bold** in Markdown, plain in text files."""
+    return f"{MK_ON}{v}{MK_OFF}"
+
+
+def strip_mk(s: str) -> str:
+    return s.replace(MK_ON, "").replace(MK_OFF, "")
+
+
+def vlen(s: str) -> int:
+    return len(strip_mk(s))
+
+
+def cut_cell(c: str, w: int) -> str:
+    """Truncate to w visible characters, keeping an alarm marker intact."""
+    if not w or vlen(c) <= w:
+        return c
+    return alarm(trunc(strip_mk(c), w)) if MK_ON in c else trunc(c, w)
+
+
+def apply_marks(line: str, color: bool) -> str:
+    """Turn markers into red (restoring the surrounding colour afterwards) or drop them."""
+    if MK_ON not in line:
+        return line
+    if not color:
+        return strip_mk(line)
+    out, active = [], ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == MK_ON:
+            out.append(ANSI["reset"] + ANSI["red"])
+        elif ch == MK_OFF:
+            out.append(ANSI["reset"] + active)
+        elif ch == "\x1b":
+            m = ANSI_CODE_RE.match(line, i)
+            if m:
+                code = m.group(0)
+                active = "" if code == ANSI["reset"] else active + code
+                out.append(code)
+                i = m.end()
+                continue
+            out.append(ch)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 class Doc:
@@ -3315,6 +3365,7 @@ class Doc:
                 out.append(self._c("=" * W, col, color))
                 if b[1]:
                     out += [self._c(b[1].center(W), col, color), self._c("=" * W, col, color)]
+        out = [apply_marks(ln, color) for ln in out]
         if color and self.highlight:
             out = [self._highlight_line(ln) for ln in out]
         return "\n".join(out) + "\n"
@@ -3360,7 +3411,7 @@ class Doc:
                 out.append("| " + " | ".join(b[1]) + " |")
                 out.append("|" + "|".join("---:" if (b[3] and b[3][i] == "r") else "---" for i in range(len(b[1]))) + "|")
                 for r in b[2]:
-                    out.append("| " + " | ".join(md_esc(trunc(c, maxw[i]) if maxw[i] else c) for i, c in enumerate(r)) + " |")
+                    out.append("| " + " | ".join(md_esc(cut_cell(str(c), maxw[i])) for i, c in enumerate(r)) + " |")
                 out.append("")
             elif k == "blank":
                 out.append("")
@@ -3372,7 +3423,7 @@ class Doc:
 
 
 def md_esc(s) -> str:
-    return str(s).replace("|", "\\|").replace("\n", " ")
+    return str(s).replace("|", "\\|").replace("\n", " ").replace(MK_ON, "**").replace(MK_OFF, "**")
 
 
 def wrap(text: str, width: int) -> list[str]:
@@ -3393,11 +3444,15 @@ def render_table(headers, rows, align=None, maxw=None, color=False) -> list[str]
     n = len(headers)
     align = align or (["l"] + ["r"] * (n - 1))
     if maxw:
-        rows = [[trunc(c, maxw[i]) if maxw[i] else c for i, c in enumerate(r)] for r in rows]
-    widths = [max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(n)]
+        rows = [[cut_cell(c, maxw[i]) for i, c in enumerate(r)] for r in rows]
+    widths = [max([len(headers[i])] + [vlen(r[i]) for r in rows]) for i in range(n)]
+
+    def pad(c, i):
+        gap = " " * (widths[i] - vlen(c))
+        return gap + c if align[i] == "r" else c + gap
 
     def line(cells):
-        return "  | " + " | ".join(c.rjust(widths[i]) if align[i] == "r" else c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+        return "  | " + " | ".join(pad(c, i) for i, c in enumerate(cells)) + " |"
     sep = "  +" + "+".join("-" * (w + 2) for w in widths) + "+"
     head = line(headers)
     if color:
@@ -3572,6 +3627,82 @@ def render_slow_requests(d: "Doc", p: dict, a):
                 [[c, k, f"{pct(k, tot):.0f}%"] for c, k in sl["components"].most_common(8)], maxw=[44, 0, 0])
 
 
+def mk(v, cond) -> str:
+    """Mark v as alarming (red) when cond is true."""
+    return alarm(v) if cond else str(v)
+
+
+def findings_narrative(p: dict, a) -> tuple[list[str], list[str]]:
+    """Turn an app's findings into plain-English sentences (impact, causes). Only measured facts; alarming values marked."""
+    fnd = p.get("findings", [])
+
+    def has(*keys):
+        return next((f for f in fnd if f["severity"] in ("critical", "high", "warning") and _has(f, *keys)), None)
+    t, fa, sl, db = p.get("traffic") or {}, p.get("fpm") or {}, p.get("slow") or {}, p.get("mysql") or {}
+    impact, cause = [], []
+    # ---- impact on visitors / the server
+    if has("5xx") and t.get("total"):
+        e5 = t.get("errors_5xx", 0)
+        impact.append(f"{alarm(format(e5, ','))} of {t['total']:,} requests ({alarm(format(pct(e5, t['total']), '.1f') + '%')}) "
+                      "ended in a server error (HTTP 5xx), so visitors saw failed pages.")
+    if p.get("oom"):
+        mx = max((e["rss_mb"] or 0) for e in p["oom"])
+        impact.append(f"The server ran out of memory and the operating system stopped {alarm(len(p['oom']))} of this application's "
+                      "PHP processes" + (f" (the largest was using {alarm(fmt_mb(mx))})" if mx else "") + ".")
+    if has("worker exhaustion") or has("queued waiting"):
+        txt = (f"PHP reached its limit of {alarm(p.get('max_children') or '?')} simultaneous workers "
+               f"{alarm(p.get('fpm_hits', 0))} time(s)" if p.get("fpm_hits") else "All PHP workers were busy")
+        if p.get("listen_queue_peak"):
+            txt += f", and up to {alarm(format(p['listen_queue_peak'], ','))} requests were waiting in the queue for a free worker"
+        impact.append(txt + ", which delays or times out page loads.")
+    if has("terminated by request_terminate_timeout"):
+        impact.append(f"{alarm(p.get('fpm_timeouts', 0))} PHP requests ran past the execution time limit and were stopped.")
+    if has("Slow PHP execution") and fa.get("requests"):
+        n, o5, o30 = fa["requests"], fa.get("over", {}).get(5, 0), fa.get("over", {}).get(30, 0)
+        impact.append(f"Pages are slow: {alarm(format(o5, ','))} of {n:,} PHP requests took longer than 5 seconds"
+                      + (f" ({alarm(format(o30, ','))} longer than 30 seconds)" if o30 else "")
+                      + f"; 95% of requests finished within {alarm(fmt_s(fa.get('p95')))} and the slowest took {alarm(fmt_s(fa.get('max_dur')))}.")
+    if has("top consumer") or has("High CPU from individual"):
+        impact.append(f"Over the window the application used about {alarm(format(p['cpu_sustained'], '.0f') + '%')} of one CPU core "
+                      f"({p['cpu_server_share']:.0f}% of the server)"
+                      + (f" and {alarm(fmt_mb(p['mem_mb']))} of memory" if p.get("mem_mb") is not None and p.get("mem_pct", 0) >= a.mem_threshold
+                         else (f" and {fmt_mb(p['mem_mb'])} of memory" if p.get("mem_mb") is not None else "")) + ".")
+    # ---- causes
+    if fa.get("top_paths_cpu") and (has("Slow PHP execution") or has("CPU cost") or has("disproportionate")):
+        x = fa["top_paths_cpu"][0]
+        cause.append(f"Most of the PHP work comes from {alarm(x['path'])} ({x['hits']:,} requests, about {x['avg_s']}s each, "
+                     f"{x['cpu_s']:,.0f}s of CPU in total).")
+    if has("CPU cost", "disproportionate") and p.get("cpu_ms_per_req"):
+        cause.append(f"On average each PHP request needs {alarm(format(p['cpu_ms_per_req'], ',.0f') + ' ms')} of CPU time, "
+                     "which points to heavy application code rather than visitor volume.")
+    if sl.get("components") and has("slow-log traces"):
+        comps = ", ".join(f"{k}" for k, _ in sl["components"].most_common(3))
+        cause.append(f"Slow-request traces ({sl['entries']:,}) point mainly to {alarm(comps)}.")
+    sdb = db.get("slow")
+    if sdb and has("Recurring slow database"):
+        fp = next((x for x in db.get("fingerprints", []) if not x["dump"]), None)
+        cause.append(f"The database recorded {alarm(sdb['count'])} slow queries ({alarm(format(round(sdb['time']), ','))} seconds in total, "
+                     f"slowest {alarm(format(sdb['max'], '.1f') + 's')})"
+                     + (f"; the most expensive pattern ran {fp['count']} times, about {alarm(format(fp['avg'], '.1f') + 's')} each: "
+                        f"{trunc(fp['fingerprint'], 90)}" if fp else "") + ".")
+    live = db.get("live") or {}
+    if has("database connections"):
+        cause.append(f"It held up to {alarm(live.get('conn_peak', 0))} database connections at the same time.")
+    bots = [b for b in t.get("bots", []) if b.get("level") in ("HIGH", "WARNING")]
+    if bots and has("BOT TRAFFIC", "Elevated bot traffic"):
+        b = bots[0]
+        cause.append(f"Automated traffic is significant: {alarm(b['name'])} sent {alarm(format(b['requests'], ','))} requests "
+                     f"({b['pct']:.0f}% of the traffic) from {b['unique_ips']:,} IPs, an estimated {b.get('php_cpu_share', 0):.0f}% of the PHP load.")
+    if p.get("traffic_signals") and has("attack activity", "impersonation"):
+        cause.append("The traffic also shows signs of abusive automation: " + "; ".join(x["text"] for x in p["traffic_signals"][:2]) + ".")
+    if has("Long-running PHP requests"):
+        cause.append(f"{alarm(len(p.get('long_busy', [])))} PHP workers stayed busy for the whole {a.sample_seconds:.0f}-second "
+                     "live sample, i.e. individual requests were running for a long time.")
+    if has("Background processes", "non-web processes"):
+        cause.append("Background processes of the application (cron, CLI or workers) were also using significant CPU.")
+    return impact, cause
+
+
 def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
     """Everything about one CRITICAL/HIGH application in one customer-shareable block.
 
@@ -3591,15 +3722,19 @@ def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
         d.text(ln)
     rc = p.get("root_cause") or {}
     d.kv([("Root cause", rc.get("text", "-")), ("Confidence", rc.get("confidence", "-"))])
-    # Findings
+    # Findings as plain-English paragraphs
     d.h3("Findings")
-    shown = [f for f in p.get("findings", []) if f["severity"] in ("critical", "high", "warning")]
-    for f in shown or p.get("findings", [])[:3]:
-        d.bullet(f"{f['text']} (confidence: {f['confidence']})", f["severity"])
-        for e in [e for e in f["evidence"] if " thresholds: " not in e][:3]:    # internal threshold detail stays out
-            d.bullet(e, None, 1)
-    if not p.get("findings"):
-        d.text("No findings.")
+    counts = Counter(f["severity"] for f in p.get("findings", []))
+    d.text("Overall: " + (", ".join(f"{counts[k]} {SEV_NAME[k]}" for k in ("critical", "high", "warning") if counts.get(k)) or "no issues")
+           + " finding(s).", sev)
+    impact, cause = findings_narrative(p, a)
+    if impact:
+        d.text("What is happening: " + " ".join(impact))
+    if cause:
+        d.text("Why: " + " ".join(cause))
+    if not impact and not cause:
+        shown = [f for f in p.get("findings", []) if f["severity"] in ("critical", "high", "warning")]
+        d.text(" ".join(f"{f['text']}." for f in shown) or "No significant findings.")
     # Resource usage
     d.h3("Resource usage")
     d.kv([("CPU (window avg)", f"{p['cpu_sustained']:.0f}% of one CPU core ({p['cpu_server_share']:.0f}% of server capacity)"),
@@ -3617,14 +3752,20 @@ def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
         d.kv([("Requests reaching the server", f"{t['total']:,} ({t['avg_rpm']:.1f}/min avg, peak {t['peak_rpm']:,}/min at {t['peak_rpm_at']} UTC)"),
               ("Dynamic (PHP) requests", f"{p['php_requests']:,}"),
               ("Unique visitor IPs", f"{t['unique_ips']:,}"),
-              ("Status codes", ", ".join(f"{k}: {v:,}" for k, v in t["status"])),
+              ("Status codes", ", ".join((alarm(f"{k}: {v:,}") if k[0] == "5" and pct(v, t["total"]) >= 5 or k in ("429", "403") and pct(v, t["total"]) >= 20
+                                          else f"{k}: {v:,}") for k, v in t["status"])),
               ("WordPress", f"REST {cats.get('rest-api', 0) + cats.get('wc-rest', 0):,}, admin-ajax {cats.get('admin-ajax', 0):,}, "
                             f"wp-login {cats.get('wp-login', 0):,}, xmlrpc {cats.get('xmlrpc', 0):,}, wp-cron {cats.get('wp-cron', 0):,}, "
                             f"WooCommerce {cats.get('woocommerce', 0):,}")])
-        d.table(["Most requested URL", "Requests", "%"], [[x["url"], f"{x['requests']:,}", f"{x['pct']:.1f}%"] for x in t["top_urls"][:5]],
-                maxw=[56, 0, 0])
-        d.table(["Top visitor IP", "Requests", "%", "Mostly"], [[x["ip"], f"{x['requests']:,}", f"{x['pct']:.1f}%", x["top_target"]]
-                                                                for x in t["top_ips"][:5]], align=["l", "r", "r", "l"])
+        d.table(["Most requested URL", "Requests", "%"],
+                [[mk(x["url"], i == 0 or x["pct"] >= 20), mk(f"{x['requests']:,}", i == 0 or x["pct"] >= 20),
+                  mk(f"{x['pct']:.1f}%", x["pct"] >= 20)] for i, x in enumerate(t["top_urls"][:5])], maxw=[56, 0, 0])
+        flagged_ips = {ip for b in t.get("bots", []) if b.get("level") in ("HIGH", "WARNING") or b.get("impersonation")
+                       for ip, _ in b["top_ips"]}
+        d.table(["Top visitor IP", "Requests", "%", "Mostly"],
+                [[mk(x["ip"], i == 0 or x["pct"] >= 10 or x["ip"] in flagged_ips), mk(f"{x['requests']:,}", i == 0 or x["pct"] >= 10),
+                  mk(f"{x['pct']:.1f}%", x["pct"] >= 10), x["top_target"]] for i, x in enumerate(t["top_ips"][:5])],
+                align=["l", "r", "r", "l"])
         for sg in p.get("traffic_signals", []):
             d.bullet(sg["text"], "warning")
     else:
@@ -3634,12 +3775,14 @@ def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
     if bots:
         d.h3("Bots and crawlers")
         d.table(["Bot", "Type", "Requests", "Share", "/min", "IPs", "Dynamic %", "Est. PHP CPU"],
-                [[b["name"], b.get("category_label", b["category"]), f"{b['requests']:,}", f"{b['pct']:.0f}%", f"{b['rpm']:.1f}",
-                  f"{b['unique_ips']:,}", f"{pct(b['dynamic'], b['requests']):.0f}%", f"{b.get('php_cpu_share', 0):.0f}%"]
-                 for b in bots[:6]],
+                [[mk(b["name"], b.get("level") == "HIGH" or b.get("impersonation")), mk(b.get("category_label", b["category"]), b.get("impersonation")),
+                  mk(f"{b['requests']:,}", b.get("level") == "HIGH"), mk(f"{b['pct']:.0f}%", b["pct"] >= a.bot_share_high),
+                  f"{b['rpm']:.1f}", f"{b['unique_ips']:,}", f"{pct(b['dynamic'], b['requests']):.0f}%",
+                  mk(f"{b.get('php_cpu_share', 0):.0f}%", b.get("php_cpu_share", 0) >= 25)] for b in bots[:6]],
                 align=["l", "l", "r", "r", "r", "r", "r", "r"], maxw=[30, 26, 0, 0, 0, 0, 0, 0])
         for b in bots[:6]:
-            d.bullet(f"{b['name']} - top IPs: " + ", ".join(f"{ip} ({n:,})" for ip, n in b["top_ips"]), None)
+            hot = b.get("level") == "HIGH" or b.get("impersonation")
+            d.bullet(f"{b['name']} - top IPs: " + ", ".join(mk(f"{ip} ({n:,})", hot and k == 0) for k, (ip, n) in enumerate(b["top_ips"])), None)
             if b["category"] == "suspicious" and b.get("ua_sample"):
                 d.bullet(f"example User-Agent: {b['ua_sample']}", None, 1)
     # Slow PHP
@@ -3651,29 +3794,33 @@ def render_app_dossier(d: "Doc", R: dict, p: dict, a) -> None:
               ("Memory per request", f"avg {fmt_mb(fa.get('avg_mem'))}, max {fmt_mb(fa.get('mem_max'))}")])
         if fa.get("slowest_requests"):
             d.table(["Time (UTC)", "Status", "Duration s", "CPU s", "Waiting", "MB", "URL (slowest)"],
-                    [[r["time"], r["status"], f"{r['dur']:.2f}", f"{r['cpu_s']:.2f}", f"{max(0.0, 100 - r['cpu_pct']):.0f}%",
-                      f"{r['mem']:.0f}", r["uri"]] for r in fa["slowest_requests"][:5]],
+                    [[r["time"], mk(r["status"], r["status"][0] == "5"), mk(f"{r['dur']:.2f}", r["dur"] >= a.slow_request_seconds),
+                      f"{r['cpu_s']:.2f}", f"{max(0.0, 100 - r['cpu_pct']):.0f}%", mk(f"{r['mem']:.0f}", r["mem"] >= a.request_mem_high),
+                      mk(r["uri"], r["dur"] >= a.very_slow_request_seconds)] for r in fa["slowest_requests"][:5]],
                     align=["l", "l", "r", "r", "r", "r", "l"], maxw=[0, 0, 0, 0, 0, 0, 44])
         if fa.get("repeated_slow_paths"):
             d.table(["Repeatedly slow URL", "Slow requests", "Avg s", "Max s"],
-                    [[x["path"], x["slow_hits"], x["avg_slow_s"], x["max_s"]] for x in fa["repeated_slow_paths"][:5]], maxw=[50, 0, 0, 0])
+                    [[mk(x["path"], i == 0), mk(f"{x['slow_hits']:,}", i == 0), x["avg_slow_s"], mk(x["max_s"], x["max_s"] >= a.very_slow_request_seconds)]
+                     for i, x in enumerate(fa["repeated_slow_paths"][:5])], maxw=[50, 0, 0, 0])
         if sl.get("components"):
             d.text("Plugins/themes seen in slow-request traces: " +
                    ", ".join(f"{c} ({k})" for c, k in sl["components"].most_common(5)))
         errs = fa.get("fpm_5xx", []) + t.get("http_5xx", [])
         if errs:
-            d.text("Server errors: " + ", ".join(f"{x['status']} {x['path']} ({x['count']:,})" for x in errs[:6]))
+            d.text("Server errors: " + ", ".join(alarm(f"{x['status']} {x['path']} ({x['count']:,})") for x in errs[:6]))
     else:
         d.text("No PHP-FPM access-log data in the window.")
     # MySQL
     d.h3("Database (MySQL) slow queries")
     sdb, fps = db.get("slow"), [x for x in db.get("fingerprints", []) if not x["dump"]]
     if sdb:
-        d.kv([("Database", p["db"]), ("Slow queries", f"{sdb['count']:,} (total {sdb['time']:.0f}s, max {sdb['max']:.1f}s)")])
+        d.kv([("Database", p["db"]), ("Slow queries", alarm(f"{sdb['count']:,} (total {sdb['time']:.0f}s, max {sdb['max']:.1f}s)")
+                                                       if sdb["time"] >= 300 else f"{sdb['count']:,} (total {sdb['time']:.0f}s, max {sdb['max']:.1f}s)")])
         if fps:
             d.table(["Count", "Total s", "Avg s", "Max s", "Rows examined", "Query pattern (values masked)"],
-                    [[x["count"], f"{x['time']:.0f}", f"{x['avg']:.1f}", f"{x['max']:.1f}", f"{x['avg_rows_ex']:,.0f}", x["fingerprint"]]
-                     for x in fps[:5]], maxw=[0, 0, 0, 0, 0, 54])
+                    [[mk(x["count"], i == 0), mk(f"{x['time']:.0f}", i == 0), mk(f"{x['avg']:.1f}", x["avg"] >= 10),
+                      mk(f"{x['max']:.1f}", x["max"] >= 30), f"{x['avg_rows_ex']:,.0f}", mk(x["fingerprint"], i == 0)]
+                     for i, x in enumerate(fps[:5])], maxw=[0, 0, 0, 0, 0, 54])
     else:
         d.text("No slow queries recorded for this application's database in the window."
                if R["mysql"].get("available") else "Database data was not available for this investigation.")

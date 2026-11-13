@@ -127,3 +127,12 @@ assert _t["total"] == 11 and _t["bot_requests"] == 5, (_t["total"], _names)
 assert any(n.startswith("Outdated Chrome") and c == 3 for n, c in _names.items()), _names
 assert any(n.startswith("Future Chrome") and c == 2 for n, c in _names.items()), _names
 print("chrome-ua-classification ok", _names)
+# --- alarm markers: red in terminal, **bold** in Markdown, plain in files; table alignment and truncation preserved
+d = cw.Doc(); d.highlight = {"shop": "critical"}
+d.table(["URL", "Req"], [[cw.alarm("/catalogsearch/result/index/"), cw.alarm("57,990")], ["/", "12"]], maxw=[20, 0])
+d.text("In shop, " + cw.alarm("2,679") + " requests queued", "critical")
+txt, plain, md = d.render("txt", True), d.render("txt", False), d.render("markdown", False)
+assert cw.ANSI_CODE_RE.sub("", txt) == plain                         # colour adds nothing visible: alignment intact
+assert not any(c in plain + txt + md for c in (cw.MK_ON, cw.MK_OFF))  # markers never leak
+assert "**/catalogsearch/resu…**" in md and "\x1b[1;31m2,679" in txt and "2,679" in plain
+print("alarm-markers ok")

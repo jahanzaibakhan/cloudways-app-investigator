@@ -254,6 +254,9 @@ def main() -> int:
         check("OOM-killed app gets a shareable app report with OOM line",
               f"APPLICATION REPORT: {me}" in o3 and "Out-of-memory kills" in o3 and "Memory Exhaustion" in o3)
         check("server OOM finding names owners and trigger", "Killed by owner:" in o3 and "Triggered by: php-fpm8.3" in o3)
+        check("app report findings written as paragraphs from measured values",
+              "What is happening: The server ran out of memory and the operating system stopped 1 of this application's PHP processes "
+              "(the largest was using 512 MB)." in " ".join(o3.split()))
         print(f"\n{sum(results)}/{len(results)} exact checks passed")
         return 0 if all(results) else 1
     finally:

@@ -50,11 +50,17 @@ Add **`--full`** for the complete report described below. `--report` saves both,
 
 After the **Investigation Overview** (server, window, privileges, data sources):
 
-> In the terminal, apps with CRITICAL findings are shown **red and underlined** and HIGH apps **orange and underlined** everywhere they appear, so you can follow one app through the whole report.
+> In the terminal, apps with CRITICAL findings are shown **red and underlined** and HIGH apps **orange and underlined** everywhere they appear, so you can follow one app through the whole report. Alarming *values* (top URL, top IP, slow durations, 5xx counts, slow queries, key numbers in the findings paragraphs) are shown in **red**. With `--no-color` and in saved `.txt` files everything is plain; in Markdown the alarming values are **bold**.
 
 1. **Critical Findings**
 2. **High-Priority Findings** (HIGH, plus the top WARNINGs). Each shows the application, key metrics, evidence, confidence and next action.
-   - **Shareable application report** for every CRITICAL/HIGH app: one self-contained block (and, with `--report`, one file per app) with that app's summary, findings, resources, traffic, bots, slow PHP requests, server errors, MySQL slow queries and the matching customer recommendations. It holds only that app's data and no internal notes, so it is ready to paste into the customer's ticket.
+   - **Shareable application report** for every CRITICAL/HIGH app: one self-contained block (and, with `--report`, one file per app). It holds only that app's data and no internal notes, so it is ready to paste into the customer's ticket. It contains:
+     - summary and root cause
+     - **findings written as two paragraphs**: *What is happening* (impact) and *Why* (causes), built from the measured values
+     - resources, traffic, bots and their IPs, slow PHP requests, server errors and MySQL slow queries
+     - the matching customer recommendations
+
+     Alarming values (the most requested URL, the top visitor IP, anything over a threshold) are shown in **red** in the terminal and **bold** in Markdown.
 3. **Top Resource-Consuming Applications**: CPU and memory live vs window average/peak, PHP and backend requests, busy/idle workers, profile tags
 4. **Top Bots Across the Server**: one ranking over all applications
 5. **Overall Server Health**: CPU, load, memory, swap, iowait, steal, disks, an **OOM kill table** (each kill attributed to its application or service, with memory at kill, trigger and scope), PSI, CPU/RAM split between apps and shared services, and the **issue origin** (applications / shared services / other processes / infrastructure)
@@ -117,7 +123,7 @@ These options control different things and can be combined. The investigation it
 | `--report` | saves to `--output-dir` (default `/tmp`, mode 600) | files | the **full** report, the **summary** (`cloudways_summary_<ts>`) and one `cloudways_app_<app>_<ts>` file per CRITICAL/HIGH app, whatever is printed on screen |
 | `--json` | also saves machine-readable results | file | all collected data |
 | `--format markdown` | Markdown instead of plain text, for Jira/GitHub | stdout and saved files | same content |
-| `--no-color` | no ANSI colours, and no red/orange app-name highlighting | stdout | same content |
+| `--no-color` | no ANSI colours: no red/orange app-name highlighting and no red alarming values | stdout | same content |
 
 **`--progress` vs `--app-reports-only` in one line:** `--progress` tells you what the script is *doing* while it runs; `--app-reports-only` decides *which report* you see at the end.
 
@@ -301,7 +307,7 @@ What was actually run (2026-11-12):
 |---|---|---|
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
-| `tests/test_exact_counts.py` (38 checks, incl. OOM kill parsing and attribution by UID/cgroup, memory at kill, trigger, dedupe, window, and the end-to-end CRITICAL block / OOM table / app report): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **38/38 pass** |
+| `tests/test_exact_counts.py` (39 checks, incl. the findings paragraph built from measured values, incl. OOM kill parsing and attribution by UID/cgroup, memory at kill, trigger, dedupe, window, and the end-to-end CRITICAL block / OOM table / app report): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **39/39 pass** |
 | `tests/test_scenarios.py` (32 checks, incl. compact summary default/length/width, symlinked-alias dedupe, incl. per-app reports: one per CRITICAL/HIGH app, no other apps' data, no internal notes, one file each) | macOS, synthetic | **32/32 pass** |
 | ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
@@ -331,7 +337,7 @@ The `tests/` folder is for development only. Servers fetch just `analyze_cloudwa
 | `tests/run_tests.sh` | runs all of the below |
 | `tests/test_parsers_and_bots.py` | log parsers (real Cloudways line formats), SQL masking, pool includes, bot verification with a stubbed DNS resolver, bot rating |
 | `tests/test_root_cause.py` | root-cause and recommendation logic (traffic-driven + upscale, DB slowness causing FPM saturation, idle app) |
-| `tests/test_exact_counts.py` | 38 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
+| `tests/test_exact_counts.py` | 39 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
 | `tests/test_scenarios.py` | 32-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
 | `tests/make_fixtures.py` | builds a small synthetic Cloudways applications root (slow plugin, busy shop, wp-login brute force) |
 
