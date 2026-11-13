@@ -226,7 +226,7 @@ def main() -> int:
         out = root / "out"
         out.mkdir()
         base = [sys.executable, str(SCRIPT), "--applications-root", str(apps_root), "--strict-root", "--sample-seconds", "4",
-                "--skip-mysql", "--skip-history", "--no-dns-verify", "--top", "2", "--output-dir", str(out)]
+                "--skip-mysql", "--skip-history", "--no-dns-verify", "--top", "2", "--output-dir", str(out), "--full"]
         r1 = subprocess.run(base + ["--no-color"], capture_output=True, text=True, timeout=120)
         check("plain text run ok and ANSI-free", r1.returncode == 0 and "\x1b[" not in r1.stdout, r1.stderr[-200:])
         check("password never printed", "hunter2" not in r1.stdout)

@@ -37,6 +37,17 @@ It needs Python ≥ 3.7 and only the standard library. Nothing is installed.
 
 ## What the report contains
 
+**Default output: compact summary.** Plain `python3 -` prints a one-screen summary:
+- server status line and issue origin
+- one line per CRITICAL/HIGH finding
+- top-apps table and top 5 bots
+- a short digest per app (traffic, PHP, slow URLs, MySQL, OOM, next action)
+- customer recommendations
+
+Add **`--full`** for the complete report described below. `--report` saves both, plus per-app reports.
+
+**Full report (`--full`)**
+
 After the **Investigation Overview** (server, window, privileges, data sources):
 
 > In the terminal, apps with CRITICAL findings are shown **red and underlined** and HIGH apps **orange and underlined** everywhere they appear, so you can follow one app through the whole report.
@@ -96,12 +107,14 @@ These options control different things and can be combined. The investigation it
 
 | Option | What it changes | Where it goes | Report content |
 |---|---|---|---|
-| *(none)* | nothing; the default | stdout | full report (all sections + shareable app reports) |
+| *(none)* | nothing; the default | stdout | **compact summary** (findings one per line, top apps, top bots, per-app digest, customer recommendations) |
+| `--full` | prints the **complete 12-section report** instead of the summary | stdout | all sections + shareable app reports |
+| `--width N` | report width in columns (default: terminal width up to 160; 120 when piped/saved) | stdout and files | same content, wrapped at N |
 | `--progress` | adds timestamped **status messages while the script runs** (`[ 12.3s] Live resource sampling…`) | **stderr** | unchanged; never in saved files |
 | `--verbose` | everything `--progress` shows, plus debug lines (failed queries, timeouts, data notes as they happen) | stderr | unchanged |
 | `--app-reports-only` | prints **only the shareable reports** for CRITICAL/HIGH apps, or one line saying there are none | stdout | the other sections are not printed (they are still computed, and still saved with `--report`) |
 | `--no-app-reports` | leaves the shareable app reports out | stdout and saved files | full report without the app blocks |
-| `--report` | saves to `--output-dir` (default `/tmp`, mode 600) | files | the full report **plus** one `cloudways_app_<app>_<ts>` file per CRITICAL/HIGH app, even with `--app-reports-only` |
+| `--report` | saves to `--output-dir` (default `/tmp`, mode 600) | files | the **full** report, the **summary** (`cloudways_summary_<ts>`) and one `cloudways_app_<app>_<ts>` file per CRITICAL/HIGH app, whatever is printed on screen |
 | `--json` | also saves machine-readable results | file | all collected data |
 | `--format markdown` | Markdown instead of plain text, for Jira/GitHub | stdout and saved files | same content |
 | `--no-color` | no ANSI colours, and no red/orange app-name highlighting | stdout | same content |
@@ -113,8 +126,11 @@ Typical combinations:
 ```bash
 U=https://raw.githubusercontent.com/jahanzaibakhan/cloudways-app-investigator/main/analyze_cloudways_applications.py
 
-# watch progress, read the full report on screen
+# watch progress, read the compact summary on screen
 curl -sS "$U" | python3 - --top 5 --hour 1 --progress
+
+# the complete 12-section report on screen
+curl -sS "$U" | python3 - --top 5 --hour 1 --progress --full
 
 # only what you will paste to the customer, plus all files saved for the internal ticket
 curl -sS "$U" | python3 - --top 5 --hour 1 --progress --app-reports-only --report
@@ -286,7 +302,7 @@ What was actually run (2026-11-12):
 | Parser tests: FPM access, backend access, atop `-P`, pool includes, MariaDB and PHP slow logs | real log lines from a Debian 12 / MariaDB 11.4 Cloudways server | pass |
 | RCA scenarios: traffic-driven + upscale, DB slowness causing FPM saturation, idle app | unit test | pass |
 | `tests/test_exact_counts.py` (38 checks, incl. OOM kill parsing and attribution by UID/cgroup, memory at kill, trigger, dedupe, window, and the end-to-end CRITICAL block / OOM table / app report): hand-built logs with known answers (request counting incl. out-of-window, bot classification and %, server census, CPU-seconds, wall vs CPU vs wait, 5xx, repeated slow URLs, bot CPU by IP, MySQL count/total/avg/max, dump detection, literal masking, Markdown table shape, no ANSI, no password leak) | macOS | **38/38 pass** |
-| `tests/test_scenarios.py` (27 checks, incl. per-app reports: one per CRITICAL/HIGH app, no other apps' data, no internal notes, one file each) | macOS, synthetic | **27/27 pass** |
+| `tests/test_scenarios.py` (32 checks, incl. compact summary default/length/width, symlinked-alias dedupe, incl. per-app reports: one per CRITICAL/HIGH app, no other apps' data, no internal notes, one file each) | macOS, synthetic | **32/32 pass** |
 | ↳ 124 apps, run time | | 4.8 s |
 | ↳ multi-PHP pools (7.4/8.1/8.2/8.3), app `fpm-pool.conf` override beats the global default | | pass |
 | ↳ low-traffic / high-CPU app ranked #1, root cause = optimization | | pass |
@@ -316,7 +332,7 @@ The `tests/` folder is for development only. Servers fetch just `analyze_cloudwa
 | `tests/test_parsers_and_bots.py` | log parsers (real Cloudways line formats), SQL masking, pool includes, bot verification with a stubbed DNS resolver, bot rating |
 | `tests/test_root_cause.py` | root-cause and recommendation logic (traffic-driven + upscale, DB slowness causing FPM saturation, idle app) |
 | `tests/test_exact_counts.py` | 38 deterministic checks with exact expected numbers (counting, percentages, PHP-FPM metrics, MySQL aggregation, masking, formatting) |
-| `tests/test_scenarios.py` | 27-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
+| `tests/test_scenarios.py` | 32-check end-to-end matrix on 124 synthetic apps (multi-PHP pools, missing/unreadable logs, nginx-only app, xmlrpc flood, crawlers, impersonation) |
 | `tests/make_fixtures.py` | builds a small synthetic Cloudways applications root (slow plugin, busy shop, wp-login brute force) |
 
 To test changes on a real server without copying files there, push a branch and run:

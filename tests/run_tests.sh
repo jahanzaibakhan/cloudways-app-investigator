@@ -12,7 +12,7 @@ grep -q "^a {'primary': 'traffic'" "$tmp/rca.txt" && grep -q "^b {'primary': 'da
 echo "PASS root-cause scenarios"
 python3 "$here/make_fixtures.py" "$tmp" >/dev/null
 python3 "$here/../analyze_cloudways_applications.py" --applications-root "$tmp/applications" --strict-root \
-  --sample-seconds 4 --skip-mysql --skip-history --top 3 --no-color > "$tmp/report.txt" 2>"$tmp/err.txt" || { cat "$tmp/err.txt"; fail "end-to-end (crashed)"; }
+  --sample-seconds 4 --skip-mysql --skip-history --top 3 --no-color --full > "$tmp/report.txt" 2>"$tmp/err.txt" || { cat "$tmp/err.txt"; fail "end-to-end (crashed)"; }
 awk '/9. ROOT CAUSE/,/10. INTERNAL/' "$tmp/report.txt" > "$tmp/rc.txt"
 grep -q "Inefficient application (PHP) execution" "$tmp/rc.txt" && grep -q "Suspicious / bot traffic" "$tmp/rc.txt" \
   || fail "end-to-end report (root causes not found in section 9)"

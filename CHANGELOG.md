@@ -2,6 +2,25 @@
 
 All notable changes to `analyze_cloudways_applications.py`. The execution command and every existing flag stay compatible across versions.
 
+## 1.6.0 - 2026-11-13
+
+### Changed
+- **The default screen output is now a compact summary** (about 60 lines for 2 apps, instead of several hundred). It contains:
+  - one server-status line, each metric coloured on its own
+  - the issue origin
+  - one line per CRITICAL/HIGH finding with its key metrics, and WARNINGs collapsed into one line
+  - a top-apps table (CPU, memory, PHP/min, p95, bot %, workers, short root cause)
+  - the top 5 bots with their top IP
+  - a short digest per app: traffic, PHP, slow URLs, slow-log plugins, MySQL, OOM, next action
+  - the customer-shareable recommendations
+
+  **`--full`** prints the complete 12-section report as before. `--report` saves the full report, the summary (`cloudways_summary_<ts>`) and the per-app reports. `--app-reports-only` is unchanged.
+- **Width follows the terminal** (up to 160 columns; 120 when piped or saved) instead of a fixed 78, so lines no longer wrap early. `--width N` overrides.
+
+### Fixed
+- **Double-counted applications:** an app directory reached through a symlink (e.g. `magento2_prd -> weryrreupf`) was analysed as a second application with the same logs, so traffic and CPU appeared twice. Apps are now de-duplicated by real path: they are counted once under the real app ID, and the alias is shown next to it.
+- **Misleading CPU finding title:** "CPU consumption is disproportionate to traffic" was also shown when the real trigger was high CPU per request, even with a 0.3x CPU/traffic ratio in its own evidence. That case is now titled "High CPU cost per PHP request" and leads with the per-request evidence.
+
 ## 1.5.0 - 2026-11-12
 
 ### Added

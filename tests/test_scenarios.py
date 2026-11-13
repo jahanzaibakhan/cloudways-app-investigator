@@ -124,11 +124,12 @@ def main() -> int:
         write_app(tmp, "noperm", 400)
         os.chmod(tmp / "applications" / "noperm" / "logs" / "php-app.access.log", 0)   # unreadable
         (tmp / "applications" / ".hidden" / "logs").mkdir(parents=True)                 # must be ignored
+        os.symlink(tmp / "applications" / "busyblog", tmp / "applications" / "aaa_alias_of_busyblog")   # alias, sorts first
 
         cmd = [sys.executable, str(SCRIPT), "--applications-root", str(tmp / "applications"), "--strict-root",
                "--pool-conf-glob", str(tmp / "etc/php/*/fpm/pool.d/*.conf"), "--sample-seconds", "4",
                "--skip-mysql", "--skip-history", "--cpu-threshold", "3", "--no-color",
-               "--report", "--format", "markdown", "--json", "--output-dir", str(out), "--no-dns-verify", "--top", "8"]
+               "--report", "--format", "markdown", "--json", "--output-dir", str(out), "--no-dns-verify", "--top", "8", "--full"]
         t0 = time.time()
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         dt = time.time() - t0
@@ -142,7 +143,9 @@ def main() -> int:
         data = json.load(open(glob.glob(str(out / "*.json"))[0]))
         md = open(glob.glob(str(out / "*.md"))[0]).read()
         top = {x["app"]: x for x in data["top"]}
-        check("app discovery (124 apps, hidden dir ignored)", data["app_count"] == 124, f"found {data['app_count']}")
+        check("app discovery (124 apps, hidden dir ignored, symlinked alias counted once)", data["app_count"] == 124,
+              f"found {data['app_count']}")
+        check("alias is not listed as its own app", "aaa_alias_of_busyblog" not in top, list(top))
         check("runtime with 124 apps < 60s", dt < 60, f"{dt:.1f}s")
         check("slow low-traffic app ranked in top 3", "slowshop" in [x["app"] for x in data["top"][:3]], [x["app"] for x in data["top"][:3]])
         s = top.get("slowshop", {})
@@ -199,6 +202,17 @@ def main() -> int:
               "PlatformOps" not in doss and " thresholds: " not in doss and "NOT for customer" not in doss)
         files = sorted(x.name for x in out.glob("cloudways_app_*_*.md") if not x.name.startswith("cloudways_app_investigation"))
         check("one saved file per priority app", len({f.split("_2")[0] for f in files}) == len(prio), files)
+        cmd_c = [c for c in cmd if c not in ("--full", "markdown")]
+        cmd_c = [c for i, c in enumerate(cmd_c) if not (c == "--format")]       # plain text: the width check is about wrapping
+        pc = subprocess.run(cmd_c + ["--width", "100"], capture_output=True, text=True, timeout=120)
+        cl = pc.stdout.splitlines()
+        check("compact summary is the default and short (< 150 lines for 8 apps)",
+              pc.returncode == 0 and "CLOUDWAYS INVESTIGATION SUMMARY" in pc.stdout and len(cl) < 150, f"{len(cl)} lines")
+        check("compact summary omits the full sections", "7. PHP-FPM INVESTIGATION" not in pc.stdout.upper()
+              and "Application digest" in pc.stdout and "Customer-shareable recommendations" in pc.stdout)
+        long_text = [ln for ln in cl if not ln.lstrip().startswith(("|", "+")) and len(ln) > 100 and " saved: " not in ln]
+        check("--width respected for non-table lines", not long_text, long_text[:2])
+        check("--report also saves the compact summary file", any(out.glob("cloudways_summary_*")))
         check("credentials never printed", "secret" not in p.stdout and "secret" not in md)
         check("markdown report has no ANSI codes", "\x1b[" not in md)
         check("customer block present", ">>> BEGIN CUSTOMER RESPONSE >>>" in p.stdout)

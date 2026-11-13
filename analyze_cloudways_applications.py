@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from heapq import heappush, heapreplace
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -437,6 +437,7 @@ def detect_app_meta(app_dir: Path) -> dict:
 
 def collect_apps(roots: list[Path]) -> dict[str, dict]:
     apps: dict[str, dict] = {}
+    by_real: dict[str, str] = {}          # real path of app dir -> app name (dedupe symlinked aliases)
     for root in roots:
         try:
             children = sorted(root.iterdir())
@@ -448,6 +449,20 @@ def collect_apps(roots: list[Path]) -> dict[str, dict]:
                 continue
             if not (safe_is_dir(d / "public_html") or safe_is_dir(d / "conf")):
                 continue
+            real = os.path.realpath(d)
+            if real in by_real:
+                # Same directory reached through a symlink: count it once, under the real (non-symlink) name.
+                first = by_real[real]
+                if os.path.islink(apps[first]["app_dir"]) and not os.path.islink(d):
+                    entry = apps.pop(first)
+                    entry["aliases"] = entry.get("aliases", []) + [first]
+                    entry.update({"app": d.name, "app_dir": d})
+                    apps[d.name] = entry
+                    by_real[real] = d.name
+                else:
+                    apps[first].setdefault("aliases", []).append(d.name)
+                continue
+            by_real[real] = d.name
             try:
                 names = os.listdir(logs)
             except OSError:
@@ -2366,6 +2381,7 @@ def build_profiles(ctx: Ctx, apps: dict, sample: dict, history: dict | None, fpm
         p = {
             "app": name, "domain": app.get("domain", ""), "type": app.get("type", ""), "app_dir": str(app["app_dir"]),
             "db": app.get("db_name") or name, "db_source": app.get("db_source") or "Cloudways convention (db = app id)",
+            "aliases": app.get("aliases", []),
             "cpu_sustained": sustained, "cpu_source": src,
             "cpu_live_avg": lv.get("cpu_avg"), "cpu_live_peak": lv.get("cpu_peak"),
             "cpu_hist_avg": hv["cpu_avg"] if hv else None, "cpu_hist_peak": hv["cpu_peak"] if hv else None,
@@ -2425,6 +2441,7 @@ NEXT_ACTIONS = [
     ("High backend/PHP request volume", "Check cache hit ratio (Varnish/page cache) and whether the dynamic requests are bots or real users."),
     ("Application is a top consumer", "Confirm with the per-app process list and the CPU source shown; compare against the window average before acting."),
     ("proportional to legitimate PHP traffic", "Check whether resource pressure is sustained (atop history); if so evaluate upscaling, otherwise monitor peak hours."),
+    ("High CPU cost per PHP request", "Profile the top CPU paths (New Relic/Xdebug/Query Monitor); review plugins, theme and custom code on those URLs."),
     ("disproportionate to traffic", "Profile the top CPU paths (New Relic/Xdebug/Query Monitor); review plugins, theme and custom code on those URLs."),
     ("non-web processes", "Identify the job from the command line; review its schedule and runtime with the application owner."),
     ("Background processes owned", "Identify the process from its command line and confirm with the customer whether it is expected."),
@@ -2570,11 +2587,17 @@ def investigate_app(ctx: Ctx, p: dict, server: dict, window_h: float) -> dict:
                           f"Average CPU per request {per_req:.0f} ms (below {a.cpu_ms_per_req_threshold} ms threshold)"],
                          scenario="traffic"))
         elif (ratio is not None and ratio >= 3 and p["php_cpu_share"] >= 25) or per_req >= a.cpu_ms_per_req_threshold:
-            fnd.append(F("correlation", "warning", "Likely",
-                         "CPU consumption is disproportionate to traffic - inefficient PHP execution per request",
+            disprop = ratio is not None and ratio >= 3 and p["php_cpu_share"] >= 25
+            title = ("CPU consumption is disproportionate to traffic - inefficient PHP execution per request" if disprop
+                     else "High CPU cost per PHP request - inefficient PHP execution")
+            fnd.append(F("correlation", "warning", "Likely", title,
+                         [f"Average CPU per request {per_req:,.0f} ms (threshold {a.cpu_ms_per_req_threshold:,.0f} ms); "
+                          f"p95 duration {fmt_s(fa.get('p95'))}",
+                          f"{p['php_cpu_share']:.0f}% of server PHP CPU time from {p['php_req_share']:.0f}% of PHP requests"
+                          + (f" ({ratio:.1f}x)" if ratio else "")] if not disprop else
                          [f"{p['php_cpu_share']:.0f}% of server PHP CPU time from {p['php_req_share']:.0f}% of PHP requests"
                           + (f" ({ratio:.1f}x)" if ratio else ""),
-                          f"Average CPU per request {per_req:.0f} ms; p95 duration {fmt_s(fa.get('p95'))}"],
+                          f"Average CPU per request {per_req:,.0f} ms; p95 duration {fmt_s(fa.get('p95'))}"],
                          scenario="optimization"))
     elif hi_cpu and not p["php_requests"]:
         non_fpm = {k: v for k, v in p["proc_kinds"].items() if not k.startswith("fpm:")}
@@ -2811,7 +2834,7 @@ def calibrate_app_severity(ctx: Ctx, p: dict, fnd: list, h: dict):
                 "high" if share >= a.cpu_high or mem >= a.mem_high else "warning"
             f["metrics"] = [("CPU", f"{p['cpu_sustained']:.0f}% of a core ({share:.0f}% of server) [{p['cpu_source']}]"),
                             ("Memory", f"{fmt_mb(p['mem_mb'])} ({mem:.0f}% of RAM)" if p["mem_mb"] is not None else "n/a (no live data)")]
-        elif _has(f, "disproportionate"):
+        elif _has(f, "disproportionate", "High CPU cost per PHP request"):
             sev = "high" if p["cpu_server_share"] >= a.cpu_threshold * 2 or srv_busy >= 70 else "warning"
         elif _has(f, "proportional to legitimate"):
             sev = "info"
@@ -2905,6 +2928,9 @@ def fmt_s(v) -> str:
     return f"{v:.2f}s" if isinstance(v, (int, float)) else "n/a"
 
 
+SCENARIO_SHORT = {"suspicious": "Suspicious traffic", "bots": "Bot/crawler load", "memory": "Memory exhaustion (OOM)",
+                  "fpm": "PHP-FPM saturation", "database": "Slow database queries", "optimization": "Inefficient PHP",
+                  "cron": "Cron/CLI processes", "traffic": "Traffic-driven"}
 SCENARIO_TEXT = {
     "suspicious": "Suspicious / bot traffic is driving backend load",
     "bots": "Crawler / bot traffic is driving PHP load",
@@ -3198,7 +3224,19 @@ ANSI = {"red": "\033[1;31m", "orange": "\033[1;38;5;208m", "yellow": "\033[1;33m
 SEV_COLOR = {"critical": "red", "high": "orange", "warning": "yellow", "info": "blue", "ok": "green"}
 SEV_TAG = {"critical": "[CRITICAL]", "high": "[HIGH]", "warning": "[WARNING]", "info": "[INFO]", "ok": "[HEALTHY]"}
 SEV_NAME = {"critical": "CRITICAL", "high": "HIGH", "warning": "WARNING", "info": "INFO", "ok": "HEALTHY"}
-W = 78
+W = 120      # report width; set from the terminal (or --width) in main()
+
+
+def set_width(args) -> int:
+    """Use the real terminal width (capped) instead of a fixed 78 columns, so lines don't wrap early."""
+    global W
+    if getattr(args, "width", 0):
+        W = max(60, args.width)
+    elif sys.stdout.isatty():
+        W = max(80, min(shutil.get_terminal_size((120, 24)).columns - 2, 160))
+    else:
+        W = 120
+    return W
 
 
 ANSI_CODE_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -3218,6 +3256,7 @@ class Doc:
     def table(self, headers, rows, align=None, maxw=None): self.blocks.append(("table", headers, rows, align, maxw))
     def blank(self): self.blocks.append(("blank",))
     def banner(self, t, sev=None): self.blocks.append(("banner", t, sev))
+    def inline(self, label, parts): self.blocks.append(("inline", label, parts))
 
     # -- renderers
     def render(self, fmt: str, color: bool) -> str:
@@ -3262,6 +3301,15 @@ class Doc:
                 out += render_table(b[1], b[2], b[3], b[4], color)
             elif k == "blank":
                 out.append("")
+            elif k == "inline":
+                lead, cur, clen = f"  {b[1]:<7} ", "", 0
+                for txt, sev in b[2]:
+                    piece = self._c(txt, SEV_COLOR.get(sev), color and sev is not None)
+                    if clen and clen + len(txt) + 3 > W - len(lead):
+                        out.append(lead + cur)
+                        lead, cur, clen = " " * len(lead), "", 0
+                    cur, clen = (cur + " | " + piece, clen + len(txt) + 3) if clen else (piece, len(txt))
+                out.append(lead + cur)
             elif k == "banner":
                 col = SEV_COLOR.get(b[2]) if b[2] else "cyan"
                 out.append(self._c("=" * W, col, color))
@@ -3318,6 +3366,8 @@ class Doc:
                 out.append("")
             elif k == "banner" and b[1]:
                 out += ["", f"## {b[1]}", ""]
+            elif k == "inline":
+                out += [f"**{b[1]}** " + " | ".join(f"**{t}**" if sv else t for t, sv in b[2]), ""]
         return "\n".join(out) + "\n"
 
 
@@ -3667,6 +3717,129 @@ def app_severity_map(R: dict) -> dict[str, str]:
     return worst
 
 
+def _metric(v, warn, crit, text):
+    """(text, severity) for one compact server metric."""
+    sev = None if v is None else "critical" if v >= crit else "warning" if v >= warn else None
+    return text, sev
+
+
+def build_compact(ctx: Ctx, R: dict) -> "Doc":
+    """Compact summary: only what matters, one screen per app. The full report is --full / --report."""
+    a = ctx.args
+    d = Doc()
+    R.setdefault("priority_apps", app_severity_map(R))
+    for p in R["top"]:
+        sev = R["priority_apps"].get(p["app"])
+        if sev:
+            d.highlight[p["app"]] = sev
+    h, hist = R["health"], R["health"].get("history") or {}
+    d.banner("CLOUDWAYS INVESTIGATION SUMMARY", None)
+    d.text(f"{R['hostname']} ({R['server_ip']}) | {R['window_desc']} | {NCPU} vCPU, {fmt_mb(h.get('mem_total_mb'))} RAM | "
+           f"{'root' if ctx.is_root else 'NON-ROOT: partial data'} | v{VERSION}")
+    # --- server line (each metric coloured on its own)
+    cb = (hist.get("cpu_busy") or (None, None))
+    load = h.get("load", (0, 0, 0))
+    swap_pct = pct(h.get("swap_used_mb", 0), h.get("swap_total_mb") or 0)
+    parts = [
+        _metric(cb[0] if cb[0] is not None else h.get("cpu_busy"), 70, 90,
+                f"CPU {h.get('cpu_busy', 0):.0f}% now" + (f", {cb[0]:.0f}% avg / {cb[1]:.0f}% peak in window" if cb[0] is not None else "")),
+        _metric(h.get("mem_used_pct"), 85, 95, f"RAM {h.get('mem_used_pct', 0):.0f}% of {fmt_mb(h.get('mem_total_mb'))}"),
+        _metric(swap_pct, 30, 60, f"swap {fmt_mb(h.get('swap_used_mb'))}/{fmt_mb(h.get('swap_total_mb'))}"),
+        _metric(load[1] / NCPU, 1.0, 2.0, f"load {load[1]:.1f}"),
+        _metric(h.get("steal"), a.steal_threshold, 15, f"steal {h.get('steal', 0):.1f}%"),
+        _metric(h.get("iowait"), 10, 25, f"iowait {h.get('iowait', 0):.1f}%"),
+        _metric(len(R["oom"]["events"]), 1, 1, f"OOM kills {len(R['oom']['events'])}"),
+    ]
+    for fs in h.get("filesystems", []):
+        if fs["used_pct"] >= 85:
+            parts.append(_metric(fs["used_pct"], 85, 95, f"disk {fs['mount']} {fs['used_pct']:.0f}%"))
+    d.inline("SERVER", parts)
+    o = R["origin"]
+    d.text(f"ORIGIN  {o['text']} [{o['confidence']}]", "ok" if o["origin"] == "none" else "warning")
+    # --- alerts, one line each
+    alerts = collect_alerts(R)
+    big = [x for x in alerts if x["severity"] in ("critical", "high")]
+    d.banner(f"CRITICAL & HIGH FINDINGS ({len(big)})", big[0]["severity"] if big else "ok")
+    if not big:
+        d.text("[HEALTHY] No CRITICAL or HIGH findings.", "ok")
+    for x in big:
+        key = "; ".join(f"{k} {v}" for k, v in x.get("metrics", [])[:2]) or (x["evidence"][0] if x["evidence"] else "")
+        d.text(f"{SEV_TAG[x['severity']]:<11}{x['app']:<14} {x['text']} - {key}", x["severity"])
+    warn = [x for x in alerts if x["severity"] == "warning"]
+    if warn:
+        d.text(f"+{len(warn)} WARNING: " + "; ".join(f"{x['app']}: {trunc(x['text'], 50)}" for x in warn[:4])
+               + (" ..." if len(warn) > 4 else ""), "warning")
+    # --- top apps
+    d.h3(f"Top {len(R['top'])} applications")
+    rows = []
+    for i, p in enumerate(R["top"], 1):
+        t, fa = p.get("traffic") or {}, p.get("fpm") or {}
+        rows.append([i, p["app"], trunc(p.get("domain") or "-", 26), f"{p['cpu_sustained']:.0f}%", f"{p['cpu_server_share']:.0f}%",
+                     fmt_mb(p["mem_mb"]) if p.get("mem_mb") is not None else "n/a",
+                     f"{p['php_requests'] / max(getattr(a, 'window_s', 3600) / 60, 1):.0f}", fmt_s(fa.get("p95")),
+                     f"{pct(t.get('bot_requests', 0), t.get('total') or 1):.0f}%" if t.get("total") else "-",
+                     f"{p['busy_peak']}/{p.get('max_children') or '?'}",
+                     SCENARIO_SHORT.get(p["root_cause"]["primary"], "no bottleneck")])
+    d.table(["#", "App", "Domain", "CPU core", "Srv", "Memory", "PHP/min", "p95", "Bots", "Workers", "Root cause"], rows,
+            align=["r", "l", "l", "r", "r", "r", "r", "r", "r", "r", "l"])
+    # --- top bots (server)
+    c = R.get("census")
+    if c and c.get("bots"):
+        d.h3(f"Top bots (server: {c['bot_requests']:,} of {c['total']:,} requests = {pct(c['bot_requests'], c['total']):.0f}%)")
+        d.table(["Bot", "Type", "Requests", "%", "/min", "IPs", "Top IP", "Top app"],
+                [[b["name"], b["category_label"], f"{b['requests']:,}", f"{b['pct']:.1f}%", f"{b['rpm']:.1f}", b["unique_ips"],
+                  f"{b['top_ips'][0][0]} ({b['top_ips'][0][1]:,})" if b["top_ips"] else "-",
+                  b["apps"][0][0] if b["apps"] else "-"] for b in c["bots"][:5]],
+                align=["l", "l", "r", "r", "r", "r", "l", "l"], maxw=[26, 26, 0, 0, 0, 0, 30, 14])
+    # --- per-app digest
+    d.h3("Application digest")
+    for p in R["top"]:
+        t, fa, sl = p.get("traffic") or {}, p.get("fpm") or {}, p.get("slow") or {}
+        rc = p["root_cause"]
+        sev = R["priority_apps"].get(p["app"])
+        d.text(f"{p['app']} ({p.get('domain') or p['type']})"
+               + (f" [alias: {', '.join(p['aliases'])}]" if p.get("aliases") else "")
+               + f" - {rc['text']} [{rc['confidence']}]", sev)
+        rows = []
+        if t.get("total"):
+            bots = [b for b in t.get("bots", []) if b["pct"] >= 1][:2]
+            e5 = t.get("errors_5xx", 0)
+            rows.append(("Traffic", f"{t['total']:,} req, {t['avg_rpm']:.0f}/min (peak {t['peak_rpm']:,} at {t['peak_rpm_at']}), "
+                                    f"{t['unique_ips']:,} IPs" + (f", 5xx {e5:,}" if e5 else "")
+                                    + (", bots " + ", ".join(f"{b['name']} {b['pct']:.0f}%" for b in bots) if bots else "")))
+        if fa.get("requests"):
+            rows.append(("PHP", f"{fa['requests']:,} req, p95 {fmt_s(fa.get('p95'))}, {fa.get('cpu_ms_per_req') or 0:,.0f} ms CPU/req, "
+                                f"max {fmt_mb(fa.get('mem_max'))}/req, workers {p['busy_peak']}/{p.get('max_children') or '?'}"
+                                + (f", max_children hit {p['fpm_hits']}x" if p.get("fpm_hits") else "")))
+            if fa.get("repeated_slow_paths"):
+                rows.append(("Slow URLs", ", ".join(f"{x['path']} {x['slow_hits']}x (avg {x['avg_slow_s']}s)"
+                                                    for x in fa["repeated_slow_paths"][:3])))
+        if sl.get("components"):
+            rows.append(("Slow-log", ", ".join(f"{k} ({v})" for k, v in sl["components"].most_common(3))))
+        db = p.get("mysql") or {}
+        if db.get("slow"):
+            fp = next((x for x in db.get("fingerprints", []) if not x["dump"]), None)
+            rows.append(("MySQL", f"{db['slow']['count']:,} slow queries ({db['slow']['time']:.0f}s)"
+                                  + (f" - top: {trunc(fp['fingerprint'], 70)} ({fp['count']}x, avg {fp['avg']:.1f}s)" if fp else "")))
+        if p.get("oom"):
+            mx = max((e["rss_mb"] or 0) for e in p["oom"])
+            rows.append(("OOM", f"{len(p['oom'])} kill(s)" + (f", largest {fmt_mb(mx)}" if mx else "")))
+        worst = next((f for f in p.get("findings", []) if f["severity"] in ("critical", "high", "warning")), None)
+        if worst and worst.get("action"):
+            rows.append(("Next", short_action(worst["action"])))
+        if rows:
+            d.kv(rows)
+        d.blank()
+    # --- customer recommendations
+    d.h3("Customer-shareable recommendations")
+    for cr in R["customer"]:
+        d.text(cr["title"] + (f" ({', '.join(cr['apps'])})" if cr.get("apps") else ""))
+        d.text(cr["text"])
+        d.blank()
+    d.text("More: --full (complete 12-section report) | --app-reports-only (shareable per-app reports) | --report (save all to files)")
+    return d
+
+
 def build_app_reports(ctx: Ctx, R: dict) -> dict[str, "Doc"]:
     """One standalone, shareable Doc per CRITICAL/HIGH application."""
     R.setdefault("priority_apps", app_severity_map(R))
@@ -3729,7 +3902,8 @@ def build_report(ctx: Ctx, R: dict) -> Doc:
               p.get("max_children") or "?", ", ".join(p["tags"])] for i, p in enumerate(top, 1)],
             align=["r", "l", "r", "r", "r", "r", "r", "r", "l"], maxw=[0, 12, 0, 0, 0, 0, 0, 0, 30])
     for p in top:
-        d.bullet(f"{p['app']}: {p['domain'] or 'domain n/a'} [{p['type']}] path {p['app_dir']} | DB '{p['db']}' "
+        d.bullet(f"{p['app']}: {p['domain'] or 'domain n/a'} [{p['type']}] path {p['app_dir']}"
+                 + (f" (alias: {', '.join(p['aliases'])} - counted once)" if p.get("aliases") else "") + f" | DB '{p['db']}' "
                  f"(mapping: {p['db_source']}) | CPU source: {p['cpu_source']}"
                  + (f" | live {p['cpu_live_avg']:.0f}%/peak {p['cpu_live_peak']:.0f}%" if p.get("cpu_live_avg") is not None else "")
                  + (f" | history peak {p['cpu_hist_peak']:.0f}% at {p['cpu_hist_peak_at']}" if p.get("cpu_hist_peak") is not None else "")
@@ -4015,10 +4189,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--progress", action="store_true", help="Show progress on stderr")
     ap.add_argument("--verbose", action="store_true", help="Debug output on stderr")
     ap.add_argument("--no-color", action="store_true", help="Disable terminal colours")
+    ap.add_argument("--width", type=int, default=0, help="Report width in columns (default: terminal width, max 160; 120 when piped)")
     ap.add_argument("--report", action="store_true", help="Save the report to a timestamped file")
     ap.add_argument("--format", choices=["txt", "markdown"], default="txt", help="Report/terminal format (default txt)")
     ap.add_argument("--output-dir", default="/tmp", help="Directory for --report / --json files (default /tmp)")
     ap.add_argument("--json", action="store_true", help="Also save machine-readable JSON results")
+    ap.add_argument("--full", action="store_true",
+                    help="Print the complete 12-section report instead of the compact summary (default: summary)")
     ap.add_argument("--app-reports-only", action="store_true",
                     help="Print only the shareable per-application reports for CRITICAL/HIGH applications")
     ap.add_argument("--no-app-reports", action="store_true",
@@ -4268,17 +4445,30 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
+    set_width(args)
     doc = build_report(ctx, R)
     app_docs = build_app_reports(ctx, R)
     color = sys.stdout.isatty() and not args.no_color and args.format == "txt" and not os.environ.get("NO_COLOR")
+    compact = build_compact(ctx, R)
     if args.app_reports_only:
         if not app_docs:
             print("No application has CRITICAL or HIGH findings - no application reports to show.")
         for d in app_docs.values():
             sys.stdout.write(d.render(args.format, color))
-    else:
+    elif args.full:
         sys.stdout.write(doc.render(args.format, color))
+    else:
+        sys.stdout.write(compact.render(args.format, color))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if args.report:
+        ext = "md" if args.format == "markdown" else "txt"
+        path = Path(args.output_dir) / f"cloudways_summary_{stamp}.{ext}"
+        try:
+            path.write_text(compact.render(args.format, False), encoding="utf-8")
+            os.chmod(path, 0o600)
+            print(f"Summary saved: {path}")
+        except OSError as exc:
+            print(f"Could not save summary: {exc}", file=sys.stderr)
     if args.report and app_docs and not args.no_app_reports:
         ext = "md" if args.format == "markdown" else "txt"
         for app, d in app_docs.items():
